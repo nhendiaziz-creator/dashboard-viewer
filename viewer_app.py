@@ -19,12 +19,14 @@ DAFTAR_TRACKER = [
 ]
 
 # ═══════════════════════════════════════════════════════════
-# FUNGSI LOAD DATA (Hanya membaca, tanpa akses edit)
+# FUNGSI LOAD DATA (Menggunakan st.secrets untuk keamanan)
 # ═══════════════════════════════════════════════════════════
-@st.cache_data(ttl=60) # Cache data selama 1 menit agar tidak berat
+@st.cache_data(ttl=60)
 def load_data_utama():
-    # CATATAN: Nanti saat di-online-kan, bagian ini perlu disesuaikan menggunakan st.secrets
-    gc = gspread.service_account(filename='credentials.json')
+    # Menggunakan Streamlit Secrets agar JSON tidak bocor
+    credentials = dict(st.secrets["gcp_service_account"])
+    gc = gspread.service_account_from_dict(credentials)
+    
     sh = gc.open_by_key(ID_SPREADSHEET_UTAMA)
     worksheet = sh.get_worksheet(0)
 
@@ -43,7 +45,10 @@ def load_data_utama():
 
 @st.cache_data(ttl=60)
 def load_tracker(nama_tracker: str) -> pd.DataFrame:
-    gc = gspread.service_account(filename='credentials.json')
+    # Menggunakan Streamlit Secrets agar JSON tidak bocor
+    credentials = dict(st.secrets["gcp_service_account"])
+    gc = gspread.service_account_from_dict(credentials)
+    
     sh = gc.open_by_key(ID_SPREADSHEET_TRACKER)
     ws = sh.worksheet(nama_tracker)
     raw = ws.get_all_values()
@@ -64,11 +69,142 @@ def load_tracker(nama_tracker: str) -> pd.DataFrame:
     df = df[df.apply(lambda r: any(str(v).strip() for v in r), axis=1)]
     return df.reset_index(drop=True)
 
-# Helper untuk memformat angka (disembunyikan untuk menyingkat kode, gunakan fungsi render_tracker_ringkasan yang sama persis seperti kode sebelumnya)
-# -- Masukkan fungsi parse_rupiah, _cari_kolom, dan render_tracker_ringkasan dari file sebelumnya di sini --
+# ═══════════════════════════════════════════════════════════
+# HELPER VISUALISASI TRACKER KHUSUS
+# ═══════════════════════════════════════════════════════════
+def parse_rupiah(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        series.astype(str)
+              .str.replace(r'[Rp\s\.]', '', regex=True)
+              .str.replace(',', '', regex=False),
+        errors='coerce'
+    ).fillna(0)
 
-# (Untuk contoh ini, saya melompati fungsi render_tracker agar kode tidak kepanjangan, 
-# Anda tinggal copy-paste fungsi tersebut dari app.py ke sini)
+def _cari_kolom(cols: list, *keywords: str):
+    for kw in keywords:
+        for c in cols:
+            if kw.lower() in c.lower():
+                return c
+    return None
+
+def render_tracker_ringkasan(df: pd.DataFrame, tracker_name: str):
+    cols = df.columns.tolist()
+
+    if any(k in tracker_name for k in ('RTMD', 'Kemenkes')):
+        plan_site   = _cari_kolom(cols, 'Plan Site')
+        actual_site = _cari_kolom(cols, 'Actual Site')
+        tag_ent     = _cari_kolom(cols, 'Tag Entities', 'Entitas')
+        site_name   = _cari_kolom(cols, 'Site Name')
+        progres_col = _cari_kolom(cols, 'Progres', 'Progress')
+        stat_doc    = _cari_kolom(cols, 'Stat Doc', 'Status Doc')
+
+        if plan_site: df[plan_site]   = pd.to_numeric(df[plan_site], errors='coerce').fillna(0)
+        if actual_site: df[actual_site] = pd.to_numeric(df[actual_site], errors='coerce').fillna(0)
+
+        tot_plan   = int(df[plan_site].sum()) if plan_site else 0
+        tot_actual = int(df[actual_site].sum()) if actual_site else 0
+        pct_txt    = f"{tot_actual / tot_plan * 100:.1f}%" if tot_plan else "N/A"
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("🏢 Total Site", len(df))
+        c2.metric("📋 Plan Kunjungan", tot_plan if tot_plan else "—")
+        c3.metric("✅ Actual Kunjungan", tot_actual if tot_actual else "—")
+        c4.metric("📈 Progress", pct_txt)
+
+        left, right = st.columns(2)
+        if plan_site and actual_site and site_name:
+            with left:
+                st.markdown("**Plan vs Actual Kunjungan per Site**")
+                viz = df[[site_name, plan_site, actual_site]].copy()
+                viz = viz[(viz[plan_site] > 0) | (viz[actual_site] > 0)]
+                if not viz.empty:
+                    melted = viz.melt(id_vars=site_name, value_vars=[plan_site, actual_site], var_name='Tipe', value_name='Kunjungan')
+                    fig = px.bar(melted, y=site_name, x='Kunjungan', color='Tipe', orientation='h', barmode='group',
+                                 color_discrete_map={plan_site: '#bdc3c7', actual_site: '#2ecc71'}, height=max(350, len(viz) * 28))
+                    fig.update_layout(yaxis_title="", legend_title="", margin=dict(t=20, b=0))
+                    st.plotly_chart(fig, use_container_width=True)
+
+        if tag_ent:
+            with right:
+                st.markdown("**Distribusi Entitas**")
+                tc = (df[tag_ent].replace('', 'Lainnya').fillna('Lainnya').value_counts().reset_index())
+                tc.columns = ['Entitas', 'Jumlah']
+                fig = px.pie(tc, values='Jumlah', names='Entitas', hole=0.4)
+                fig.update_layout(margin=dict(t=20, b=0))
+                st.plotly_chart(fig, use_container_width=True)
+
+        if progres_col or stat_doc:
+            l2, r2 = st.columns(2)
+            if progres_col:
+                with l2:
+                    st.markdown("**Status Progress**")
+                    pc = (df[progres_col].replace('', 'Belum').fillna('Belum').value_counts().reset_index())
+                    pc.columns = ['Progress', 'Jumlah']
+                    fig = px.bar(pc, x='Progress', y='Jumlah', color='Progress')
+                    fig.update_layout(showlegend=False, margin=dict(t=20, b=0))
+                    st.plotly_chart(fig, use_container_width=True)
+            if stat_doc:
+                with r2:
+                    st.markdown("**Status Dokumen**")
+                    dc = (df[stat_doc].replace('', 'Belum Ada').fillna('Belum Ada').value_counts().reset_index())
+                    dc.columns = ['Status', 'Jumlah']
+                    fig = px.pie(dc, values='Jumlah', names='Status', hole=0.4)
+                    fig.update_layout(margin=dict(t=20, b=0))
+                    st.plotly_chart(fig, use_container_width=True)
+
+    elif 'KDS' in tracker_name:
+        rev_col      = _cari_kolom(cols, 'Revenue')
+        cost_col     = _cari_kolom(cols, 'Cost')
+        margin_col   = next((c for c in cols if c.strip() == 'Margin'), None) or _cari_kolom(cols, 'Margin')
+        st_tagihan   = _cari_kolom(cols, 'Status Tagihan')
+        st_pekerjaan = _cari_kolom(cols, 'Status Pekerjaan')
+        period_col   = _cari_kolom(cols, 'Period')
+
+        tot_rev    = parse_rupiah(df[rev_col]).sum() if rev_col else 0
+        tot_cost   = parse_rupiah(df[cost_col]).sum() if cost_col else 0
+        tot_margin = parse_rupiah(df[margin_col]).sum() if margin_col and 'Persentase' not in margin_col else 0
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("📋 Total Pekerjaan", len(df))
+        c2.metric("💰 Total Revenue", f"Rp {tot_rev:,.0f}" if tot_rev else "—")
+        c3.metric("📉 Total Cost", f"Rp {tot_cost:,.0f}" if tot_cost else "—")
+        c4.metric("📈 Total Margin", f"Rp {tot_margin:,.0f}" if tot_margin else "—")
+
+        left, right = st.columns(2)
+        if st_tagihan:
+            with left:
+                st.markdown("**Status Tagihan**")
+                tc = (df[st_tagihan].replace('', 'N/A').fillna('N/A').value_counts().reset_index())
+                tc.columns = ['Status', 'Jumlah']
+                fig = px.pie(tc, values='Jumlah', names='Status', hole=0.4, color_discrete_sequence=px.colors.qualitative.Set2)
+                fig.update_layout(margin=dict(t=20, b=0))
+                st.plotly_chart(fig, use_container_width=True)
+        if st_pekerjaan:
+            with right:
+                st.markdown("**Status Pekerjaan**")
+                sc = (df[st_pekerjaan].replace('', 'N/A').fillna('N/A').value_counts().reset_index())
+                sc.columns = ['Status', 'Jumlah']
+                fig = px.bar(sc, x='Status', y='Jumlah', color='Status', color_discrete_sequence=px.colors.qualitative.Set2)
+                fig.update_layout(showlegend=False, margin=dict(t=20, b=0))
+                st.plotly_chart(fig, use_container_width=True)
+
+    else:
+        c1, c2 = st.columns(2)
+        c1.metric("📋 Total Baris", len(df))
+        c2.metric("🔢 Total Kolom", len(cols))
+        status_cols = [c for c in cols if any(k in c.lower() for k in ('status', 'progres', 'progress', 'kondisi', 'state'))]
+        if status_cols:
+            n = min(len(status_cols), 2)
+            chart_cols = st.columns(n)
+            for i, sc in enumerate(status_cols[:n]):
+                with chart_cols[i]:
+                    st.markdown(f"**{sc}**")
+                    vc = (df[sc].replace('', 'Kosong').fillna('Kosong').value_counts().reset_index())
+                    vc.columns = [sc, 'Jumlah']
+                    fig = px.pie(vc, values='Jumlah', names=sc, hole=0.4)
+                    fig.update_layout(margin=dict(t=20, b=0))
+                    st.plotly_chart(fig, use_container_width=True)
+
 
 # ═══════════════════════════════════════════════════════════
 # MAIN APP - TAMPILAN DASHBOARD SAJA
@@ -132,7 +268,12 @@ try:
     st.subheader("🗂️ Lihat Data Tracker Lainnya")
     selected_tracker = st.selectbox("Pilih Tracker yang ingin dilihat:", DAFTAR_TRACKER)
     df_tracker = load_tracker(selected_tracker)
+    
     if not df_tracker.empty:
+        # Menjalankan fungsi visualisasi ringkasan
+        render_tracker_ringkasan(df_tracker, selected_tracker)
+        st.markdown("---")
+        st.markdown("**Tabel Detail Tracker**")
         st.dataframe(df_tracker, use_container_width=True, height=420)
     else:
         st.warning("⚠️ Data tracker kosong.")
