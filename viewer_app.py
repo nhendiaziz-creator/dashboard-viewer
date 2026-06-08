@@ -23,7 +23,6 @@ DAFTAR_TRACKER = [
 # ═══════════════════════════════════════════════════════════
 @st.cache_data(ttl=60)
 def load_data_utama():
-    # Menggunakan Streamlit Secrets agar JSON tidak bocor
     credentials = dict(st.secrets["gcp_service_account"])
     gc = gspread.service_account_from_dict(credentials)
     
@@ -35,7 +34,11 @@ def load_data_utama():
     header_idx = df[df.eq('Nama Project').any(axis=1)].index[0]
     df.columns = df.iloc[header_idx]
     df = df.iloc[header_idx + 1:]
-    df = df.loc[:, df.columns != '']
+    
+    # Menghapus kolom kosong dan duplikat
+    df = df.loc[:, [bool(c) for c in df.columns]]
+    df = df.loc[:, ~df.columns.duplicated()]
+    
     df = df[df['Nama Project'] != '']
     df['Target']    = pd.to_numeric(df['Target'],    errors='coerce').fillna(0)
     df['Realisasi'] = pd.to_numeric(df['Realisasi'], errors='coerce').fillna(0)
@@ -45,7 +48,6 @@ def load_data_utama():
 
 @st.cache_data(ttl=60)
 def load_tracker(nama_tracker: str) -> pd.DataFrame:
-    # Menggunakan Streamlit Secrets agar JSON tidak bocor
     credentials = dict(st.secrets["gcp_service_account"])
     gc = gspread.service_account_from_dict(credentials)
     
@@ -55,9 +57,15 @@ def load_tracker(nama_tracker: str) -> pd.DataFrame:
 
     if not raw: return pd.DataFrame()
 
-    KATA_KUNCI_HEADER = ('no', 'nama', 'status', 'tanggal', 'kode', 'site', 'kategori', 'progres', 'target', 'realisasi', 'harga', 'cost', 'revenue', 'margin', 'period', 'remark', 'deadline', 'prioritas')
+    # Penambahan kata kunci deteksi untuk Tracker Nova & project telekomunikasi lainnya
+    KATA_KUNCI_HEADER = (
+        'no', 'nama', 'status', 'tanggal', 'kode', 'site', 'kategori', 
+        'progres', 'progress', 'target', 'realisasi', 'harga', 'cost', 
+        'revenue', 'margin', 'period', 'remark', 'deadline', 'prioritas',
+        'customer', 'spk', 'pekerjaan', 'tagihan', 'id', 'pic'
+    )
     best_idx, best_score = 0, -1
-    for i, row in enumerate(raw[:12]):
+    for i, row in enumerate(raw[:15]):
         filled   = [str(c).strip() for c in row if str(c).strip()]
         kw_bonus = sum(1 for c in filled if any(k in str(c).lower() for k in KATA_KUNCI_HEADER))
         score    = len(filled) + kw_bonus * 2
@@ -65,8 +73,15 @@ def load_tracker(nama_tracker: str) -> pd.DataFrame:
 
     headers = [str(h).strip() for h in raw[best_idx]]
     df = pd.DataFrame(raw[best_idx + 1:], columns=headers)
-    df = df.loc[:, [c for c in df.columns if c]]
+    
+    # ── FIX BUG UTAMA TRACKER ──
+    # 1. Buang kolom tanpa nama
+    df = df.loc[:, [bool(c) for c in df.columns]]
+    # 2. Buang duplikasi kolom (mencegah error value_counts)
+    df = df.loc[:, ~df.columns.duplicated()]
+    # 3. Buang baris yang isinya kosong semua
     df = df[df.apply(lambda r: any(str(v).strip() for v in r), axis=1)]
+    
     return df.reset_index(drop=True)
 
 # ═══════════════════════════════════════════════════════════
@@ -189,21 +204,34 @@ def render_tracker_ringkasan(df: pd.DataFrame, tracker_name: str):
                 st.plotly_chart(fig, use_container_width=True)
 
     else:
+        # ── GENERIC DASHBOARD UTK NOVA, DLL ──
         c1, c2 = st.columns(2)
         c1.metric("📋 Total Baris", len(df))
         c2.metric("🔢 Total Kolom", len(cols))
-        status_cols = [c for c in cols if any(k in c.lower() for k in ('status', 'progres', 'progress', 'kondisi', 'state'))]
+        
+        # FIX BUG: Mengabaikan kolom "Tanggal" atau "Date" agar tidak dipaksa jadi pie chart
+        status_cols = [c for c in cols if any(
+            k in c.lower() for k in ('status', 'progres', 'progress', 'kondisi', 'state')
+        ) and not any(
+            x in c.lower() for x in ('date', 'tanggal', 'waktu', 'time', 'periode', 'period')
+        )]
+        
         if status_cols:
             n = min(len(status_cols), 2)
             chart_cols = st.columns(n)
             for i, sc in enumerate(status_cols[:n]):
                 with chart_cols[i]:
                     st.markdown(f"**{sc}**")
-                    vc = (df[sc].replace('', 'Kosong').fillna('Kosong').value_counts().reset_index())
-                    vc.columns = [sc, 'Jumlah']
-                    fig = px.pie(vc, values='Jumlah', names=sc, hole=0.4)
-                    fig.update_layout(margin=dict(t=20, b=0))
-                    st.plotly_chart(fig, use_container_width=True)
+                    try:
+                        # Fix Bug: Standardisasi ke string lalu ganti blank text
+                        vc = df[sc].astype(str).replace(r'^\s*$', 'Kosong', regex=True).replace('nan', 'Kosong').value_counts().reset_index()
+                        vc.columns = ['Label', 'Jumlah']
+                        
+                        fig = px.pie(vc, values='Jumlah', names='Label', hole=0.4)
+                        fig.update_layout(margin=dict(t=20, b=0))
+                        st.plotly_chart(fig, use_container_width=True)
+                    except Exception:
+                        st.info(f"Visualisasi untuk kolom {sc} tidak dapat dimuat.")
 
 
 # ═══════════════════════════════════════════════════════════
