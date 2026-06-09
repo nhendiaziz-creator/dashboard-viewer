@@ -57,10 +57,10 @@ def load_tracker(nama_tracker: str) -> pd.DataFrame:
 
     if not raw: return pd.DataFrame()
 
-    # Penambahan kata kunci deteksi untuk Tracker Nova & project telekomunikasi lainnya
+    # Penambahan kata kunci deteksi untuk Tracker Nova, RTMD, & project telekomunikasi lainnya
     KATA_KUNCI_HEADER = (
-        'no', 'nama', 'status', 'tanggal', 'kode', 'site', 'kategori', 
-        'progres', 'progress', 'target', 'realisasi', 'harga', 'cost', 
+        'no', 'nama', 'status', 'tanggal', 'kode', 'site', 'kategori', 'po', 'plan cost', 'actual cost',
+        'progres', 'progress', 'target', 'realisasi', 'harga', 'cost', 'persentase',
         'revenue', 'margin', 'period', 'remark', 'deadline', 'prioritas',
         'customer', 'spk', 'pekerjaan', 'tagihan', 'id', 'pic'
     )
@@ -113,6 +113,10 @@ def render_tracker_ringkasan(df: pd.DataFrame, tracker_name: str):
         progres_col = _cari_kolom(cols, 'Progres', 'Progress')
         stat_doc    = _cari_kolom(cols, 'Stat Doc', 'Status Doc')
 
+        po_col      = next((c for c in cols if c.strip().lower() == 'po'), None)
+        ac_col      = next((c for c in cols if c.strip().lower() == 'actual cost'), None)
+        margin_col  = next((c for c in cols if c.strip().lower() == 'margin'), None)
+
         if plan_site: df[plan_site]   = pd.to_numeric(df[plan_site], errors='coerce').fillna(0)
         if actual_site: df[actual_site] = pd.to_numeric(df[actual_site], errors='coerce').fillna(0)
 
@@ -120,11 +124,39 @@ def render_tracker_ringkasan(df: pd.DataFrame, tracker_name: str):
         tot_actual = int(df[actual_site].sum()) if actual_site else 0
         pct_txt    = f"{tot_actual / tot_plan * 100:.1f}%" if tot_plan else "N/A"
 
+        tot_po     = parse_rupiah(df[po_col]).sum() if po_col else 0
+        tot_ac     = parse_rupiah(df[ac_col]).sum() if ac_col else 0
+        tot_margin = parse_rupiah(df[margin_col]).sum() if margin_col else 0
+
+        st.markdown("**Ringkasan Finansial**")
+        cf1, cf2, cf3, cf4 = st.columns(4)
+        cf1.metric("🏢 Total Site / Pekerjaan", len(df))
+        cf2.metric("💰 Total PO", f"Rp {tot_po:,.0f}" if tot_po else "—")
+        cf3.metric("📉 Total Actual Cost", f"Rp {tot_ac:,.0f}" if tot_ac else "—")
+        cf4.metric("📈 Total Margin", f"Rp {tot_margin:,.0f}" if tot_margin else "—")
+        
+        # Grafik Finansial Total Saja (Bukan per Site)
+        if po_col and ac_col and margin_col:
+            st.markdown("<br>", unsafe_allow_html=True)
+            fin_data = pd.DataFrame({
+                'Kategori': ['Total PO', 'Total Actual Cost', 'Total Margin'],
+                'Nilai': [tot_po, tot_ac, tot_margin]
+            })
+            
+            fig_fin = px.bar(fin_data, x='Kategori', y='Nilai', text_auto='.2s', color='Kategori',
+                             color_discrete_map={'Total PO': '#3498db', 'Total Actual Cost': '#e74c3c', 'Total Margin': '#2ecc71'})
+            fig_fin.update_traces(textfont_size=12, textangle=0, textposition="outside", cliponaxis=False)
+            fig_fin.update_layout(yaxis_title="Nilai (Rp)", showlegend=False, margin=dict(t=20, b=0), height=350)
+            st.plotly_chart(fig_fin, use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("**Ringkasan Kunjungan**")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("🏢 Total Site", len(df))
-        c2.metric("📋 Plan Kunjungan", tot_plan if tot_plan else "—")
-        c3.metric("✅ Actual Kunjungan", tot_actual if tot_actual else "—")
-        c4.metric("📈 Progress", pct_txt)
+        c1.metric("📋 Plan Kunjungan", tot_plan if tot_plan else "—")
+        c2.metric("✅ Actual Kunjungan", tot_actual if tot_actual else "—")
+        c3.metric("📈 Progress Kunjungan", pct_txt)
+        
+        st.markdown("<br>", unsafe_allow_html=True)
 
         left, right = st.columns(2)
         if plan_site and actual_site and site_name:
@@ -135,7 +167,7 @@ def render_tracker_ringkasan(df: pd.DataFrame, tracker_name: str):
                 if not viz.empty:
                     melted = viz.melt(id_vars=site_name, value_vars=[plan_site, actual_site], var_name='Tipe', value_name='Kunjungan')
                     fig = px.bar(melted, y=site_name, x='Kunjungan', color='Tipe', orientation='h', barmode='group',
-                                 color_discrete_map={plan_site: '#bdc3c7', actual_site: '#2ecc71'}, height=max(350, len(viz) * 28))
+                                 color_discrete_map={plan_site: '#bdc3c7', actual_site: '#2ecc71'}, height=max(350, len(viz) * 35))
                     fig.update_layout(yaxis_title="", legend_title="", margin=dict(t=20, b=0))
                     st.plotly_chart(fig, use_container_width=True)
 
@@ -203,13 +235,23 @@ def render_tracker_ringkasan(df: pd.DataFrame, tracker_name: str):
                 fig.update_layout(showlegend=False, margin=dict(t=20, b=0))
                 st.plotly_chart(fig, use_container_width=True)
 
+        if rev_col and period_col:
+            st.markdown("**Revenue per Period**")
+            dp = df[[period_col, rev_col]].copy()
+            dp[rev_col] = parse_rupiah(dp[rev_col])
+            dp = dp.groupby(period_col)[rev_col].sum().reset_index()
+            dp.columns = ['Period', 'Revenue']
+            fig = px.bar(dp, x='Period', y='Revenue', color_discrete_sequence=['#3498db'])
+            fig.update_layout(xaxis_title="Period", yaxis_title="Revenue (Rp)", margin=dict(t=20, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+
     else:
         # ── GENERIC DASHBOARD UTK NOVA, DLL ──
         c1, c2 = st.columns(2)
         c1.metric("📋 Total Baris", len(df))
         c2.metric("🔢 Total Kolom", len(cols))
         
-        # FIX BUG: Mengabaikan kolom "Tanggal" atau "Date" agar tidak dipaksa jadi pie chart
+        # Fix Bug: Mengabaikan kolom "Tanggal" atau "Date" agar tidak dipaksa jadi pie chart
         status_cols = [c for c in cols if any(
             k in c.lower() for k in ('status', 'progres', 'progress', 'kondisi', 'state')
         ) and not any(
@@ -223,7 +265,7 @@ def render_tracker_ringkasan(df: pd.DataFrame, tracker_name: str):
                 with chart_cols[i]:
                     st.markdown(f"**{sc}**")
                     try:
-                        # Fix Bug: Standardisasi ke string lalu ganti blank text
+                        # Standardisasi ke string lalu ganti blank text
                         vc = df[sc].astype(str).replace(r'^\s*$', 'Kosong', regex=True).replace('nan', 'Kosong').value_counts().reset_index()
                         vc.columns = ['Label', 'Jumlah']
                         
