@@ -336,7 +336,20 @@ try:
     # ── Tracker Khusus ──────────────────────────────────────────────
     st.markdown("---")
     st.subheader("🗂️ Lihat Data Tracker Lainnya")
-    selected_tracker = st.selectbox("Pilih Tracker yang ingin dilihat:", DAFTAR_TRACKER)
+    
+    col_sel, col_btn = st.columns([3, 1])
+    with col_sel:
+        selected_tracker = st.selectbox("Pilih Tracker yang ingin dilihat:", DAFTAR_TRACKER)
+    with col_btn:
+        st.markdown("<br>", unsafe_allow_html=True)
+        btn_muat = st.button("🔄 Muat / Refresh", use_container_width=True)
+
+    # Logika untuk membersihkan memori Cache dan memuat ulang halaman
+    if btn_muat:
+        load_data_utama.clear()
+        load_tracker.clear()
+        st.rerun()
+
     df_tracker = load_tracker(selected_tracker)
     
     if not df_tracker.empty:
