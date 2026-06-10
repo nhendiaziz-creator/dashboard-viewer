@@ -2,10 +2,9 @@ import streamlit as st
 import gspread
 import pandas as pd
 import plotly.express as px
+from datetime import datetime
 
 st.set_page_config(page_title="Dashboard Project Viewer", layout="wide")
-st.title("📊 Dashboard Manajemen Project (View Only)")
-st.markdown("---")
 
 # ═══════════════════════════════════════════════════════════
 # KONFIGURASI
@@ -19,7 +18,7 @@ DAFTAR_TRACKER = [
 ]
 
 # ═══════════════════════════════════════════════════════════
-# FUNGSI LOAD DATA (Menggunakan st.secrets untuk keamanan)
+# FUNGSI LOAD DATA (Menggunakan st.secrets & Caching)
 # ═══════════════════════════════════════════════════════════
 @st.cache_data(ttl=60)
 def load_data_utama():
@@ -35,7 +34,6 @@ def load_data_utama():
     df.columns = df.iloc[header_idx]
     df = df.iloc[header_idx + 1:]
     
-    # Menghapus kolom kosong dan duplikat
     df = df.loc[:, [bool(c) for c in df.columns]]
     df = df.loc[:, ~df.columns.duplicated()]
     
@@ -57,12 +55,11 @@ def load_tracker(nama_tracker: str) -> pd.DataFrame:
 
     if not raw: return pd.DataFrame()
 
-    # Penambahan kata kunci deteksi untuk Tracker Nova, RTMD, & project telekomunikasi lainnya
     KATA_KUNCI_HEADER = (
         'no', 'nama', 'status', 'tanggal', 'kode', 'site', 'kategori', 'po', 'plan cost', 'actual cost',
         'progres', 'progress', 'target', 'realisasi', 'harga', 'cost', 'persentase',
         'revenue', 'margin', 'period', 'remark', 'deadline', 'prioritas',
-        'customer', 'spk', 'pekerjaan', 'tagihan', 'id', 'pic'
+        'customer', 'spk', 'pekerjaan', 'tagihan', 'id', 'pic', 'assign'
     )
     best_idx, best_score = 0, -1
     for i, row in enumerate(raw[:15]):
@@ -74,14 +71,48 @@ def load_tracker(nama_tracker: str) -> pd.DataFrame:
     headers = [str(h).strip() for h in raw[best_idx]]
     df = pd.DataFrame(raw[best_idx + 1:], columns=headers)
     
-    # ── FIX BUG UTAMA TRACKER ──
-    # 1. Buang kolom tanpa nama
     df = df.loc[:, [bool(c) for c in df.columns]]
-    # 2. Buang duplikasi kolom (mencegah error value_counts)
     df = df.loc[:, ~df.columns.duplicated()]
-    # 3. Buang baris yang isinya kosong semua
     df = df[df.apply(lambda r: any(str(v).strip() for v in r), axis=1)]
     
+    return df.reset_index(drop=True)
+
+@st.cache_data(ttl=60)
+def load_timeline_dssp():
+    credentials = dict(st.secrets["gcp_service_account"])
+    gc = gspread.service_account_from_dict(credentials)
+    sh = gc.open_by_key(ID_SPREADSHEET_TRACKER)
+    try:
+        ws = sh.worksheet("Timeline")
+    except gspread.exceptions.WorksheetNotFound:
+        return pd.DataFrame()
+
+    raw = ws.get_all_values()
+    if not raw:
+        return pd.DataFrame()
+
+    KATA_KUNCI = ('sub-task', 'sub task', 'start')
+    header_idx = -1
+    for i, row in enumerate(raw[:15]): 
+        if any(k in str(c).lower() for c in row for k in KATA_KUNCI):
+            header_idx = i
+            break
+
+    if header_idx == -1:
+        return pd.DataFrame()
+
+    headers = [str(h).strip() for h in raw[header_idx]]
+    df = pd.DataFrame(raw[header_idx + 1:], columns=headers)
+
+    core_cols = ['Task', 'Sub-Task', 'Start', 'Deadline Finish', 'Actual Finish Date', 'Remark Status', 'PIC']
+    available_cols = [c for c in core_cols if c in df.columns]
+    df = df[available_cols]
+
+    if 'Sub-Task' in df.columns:
+        df = df[df['Sub-Task'].astype(str).str.strip() != '']
+    if 'Task' in df.columns:
+        df['Task'] = df['Task'].replace(r'^\s*$', pd.NA, regex=True).ffill()
+
     return df.reset_index(drop=True)
 
 # ═══════════════════════════════════════════════════════════
@@ -135,7 +166,6 @@ def render_tracker_ringkasan(df: pd.DataFrame, tracker_name: str):
         cf3.metric("📉 Total Actual Cost", f"Rp {tot_ac:,.0f}" if tot_ac else "—")
         cf4.metric("📈 Total Margin", f"Rp {tot_margin:,.0f}" if tot_margin else "—")
         
-        # Grafik Finansial Total Saja (Bukan per Site)
         if po_col and ac_col and margin_col:
             st.markdown("<br>", unsafe_allow_html=True)
             fin_data = pd.DataFrame({
@@ -246,12 +276,10 @@ def render_tracker_ringkasan(df: pd.DataFrame, tracker_name: str):
             st.plotly_chart(fig, use_container_width=True)
 
     else:
-        # ── GENERIC DASHBOARD UTK NOVA, DLL ──
         c1, c2 = st.columns(2)
         c1.metric("📋 Total Baris", len(df))
         c2.metric("🔢 Total Kolom", len(cols))
         
-        # Fix Bug: Mengabaikan kolom "Tanggal" atau "Date" agar tidak dipaksa jadi pie chart
         status_cols = [c for c in cols if any(
             k in c.lower() for k in ('status', 'progres', 'progress', 'kondisi', 'state')
         ) and not any(
@@ -265,7 +293,6 @@ def render_tracker_ringkasan(df: pd.DataFrame, tracker_name: str):
                 with chart_cols[i]:
                     st.markdown(f"**{sc}**")
                     try:
-                        # Standardisasi ke string lalu ganti blank text
                         vc = df[sc].astype(str).replace(r'^\s*$', 'Kosong', regex=True).replace('nan', 'Kosong').value_counts().reset_index()
                         vc.columns = ['Label', 'Jumlah']
                         
@@ -277,89 +304,203 @@ def render_tracker_ringkasan(df: pd.DataFrame, tracker_name: str):
 
 
 # ═══════════════════════════════════════════════════════════
-# MAIN APP - TAMPILAN DASHBOARD SAJA
+# MAIN APP - TAMPILAN DASHBOARD SAJA (VIEWER)
 # ═══════════════════════════════════════════════════════════
 try:
-    df = load_data_utama()
-
-    # ── Ringkasan Eksekutif ─────────────────────────────────────────
-    st.subheader("Ringkasan Eksekutif")
-    c1, c2, c3 = st.columns(3)
-    total_target       = df['Target'].sum()
-    total_realisasi    = df['Realisasi'].sum()
-    persen_keseluruhan = (total_realisasi / total_target * 100) if total_target > 0 else 0
-    c1.metric("Total Project",          len(df))
-    c2.metric("Target Rata-rata",       "100%")
-    c3.metric("Pencapaian Keseluruhan", f"{persen_keseluruhan:.1f}%")
-    st.markdown("---")
-
-    # ── Visualisasi Analytics ───────────────────────────────────────
-    st.subheader("Visualisasi Analytics")
-    col_chart1, col_chart2 = st.columns(2)
-
-    with col_chart1:
-        st.markdown("**Status Keseluruhan (Total)**")
-        data_pie = pd.DataFrame({
-            'Status': ['Sudah Terealisasi', 'Sisa Target Belum Tercapai'],
-            'Nilai':  [total_realisasi, total_target - total_realisasi],
-        })
-        fig_pie = px.pie(data_pie, values='Nilai', names='Status', hole=0.4,
-                         color='Status', color_discrete_map={'Sudah Terealisasi': '#2ecc71', 'Sisa Target Belum Tercapai': '#e74c3c'})
-        fig_pie.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="center", x=0.5), margin=dict(t=50, b=0, l=0, r=0))
-        st.plotly_chart(fig_pie, use_container_width=True)
-
-    with col_chart2:
-        st.markdown("**Progress Spesifik per Project (On Progress & Pending)**")
-        df_filtered = df[df['Status'].isin(['On Progress', 'Pending'])].copy()
-        if not df_filtered.empty:
-            priority_map = {'High': 1, 'Medium': 2, 'Low': 3}
-            df_filtered['Priority_Rank'] = df_filtered['Prioritas'].map(priority_map).fillna(4)
-            df_filtered = df_filtered.sort_values(by=['Priority_Rank', 'Nama Project'], ascending=[False, False])
-            
-            df_melt = df_filtered.melt(id_vars='Nama Project', value_vars=['Target', 'Realisasi'], var_name='Kategori_Stat', value_name='Nilai (%)')
-            fig_bar = px.bar(df_melt, y='Nama Project', x='Nilai (%)', color='Kategori_Stat', barmode='group', orientation='h',
-                             color_discrete_map={'Target': '#bdc3c7', 'Realisasi': '#3498db'})
-            fig_bar.update_layout(yaxis_title="", xaxis_title="Persentase (%)", legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="center", x=0.5), margin=dict(t=50, b=0, l=0, r=0))
-            st.plotly_chart(fig_bar, use_container_width=True)
-        else:
-            st.info("👍 Tidak ada project yang On Progress atau Pending.")
-
-    # ── Detail Status Project ───────────────────────────────────────
-    st.markdown("---")
-    st.subheader("Detail Status Project")
-    priority_map = {'High': 1, 'Medium': 2, 'Low': 3}
-    df_display = df.copy()
-    df_display['Priority_Rank'] = df_display['Prioritas'].map(priority_map).fillna(4)
-    df_display = df_display.sort_values(by=['Priority_Rank', 'Nama Project']).drop(columns=['Priority_Rank'])
-    st.dataframe(df_display, use_container_width=True)
-
-    # ── Tracker Khusus ──────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("🗂️ Lihat Data Tracker Lainnya")
-    
-    col_sel, col_btn = st.columns([3, 1])
-    with col_sel:
-        selected_tracker = st.selectbox("Pilih Tracker yang ingin dilihat:", DAFTAR_TRACKER)
+    # ── HEADER & TOMBOL REFRESH GLOBAL ──
+    col_title, col_btn = st.columns([5, 1])
+    with col_title:
+        st.title("📊 Dashboard Manajemen Project (View Only)")
     with col_btn:
         st.markdown("<br>", unsafe_allow_html=True)
-        btn_muat = st.button("🔄 Muat / Refresh", use_container_width=True)
+        if st.button("🔄 Muat Ulang Data", use_container_width=True):
+            load_data_utama.clear()
+            load_tracker.clear()
+            load_timeline_dssp.clear()
+            st.rerun()
+            
+    st.markdown("---")
 
-    # Logika untuk membersihkan memori Cache dan memuat ulang halaman
-    if btn_muat:
-        load_data_utama.clear()
-        load_tracker.clear()
-        st.rerun()
+    df = load_data_utama()
 
-    df_tracker = load_tracker(selected_tracker)
-    
-    if not df_tracker.empty:
-        # Menjalankan fungsi visualisasi ringkasan
-        render_tracker_ringkasan(df_tracker, selected_tracker)
+    # ── TABS UNTUK VIEWER ──
+    tab1, tab2, tab3 = st.tabs([
+        "📊 Main Dashboard", 
+        "🗂️ Lihat Tracker", 
+        "📅 Timeline DSSP"
+    ])
+
+    # ── TAB 1 : MAIN DASHBOARD ──
+    with tab1:
+        st.subheader("Ringkasan Eksekutif")
+        c1, c2, c3 = st.columns(3)
+        total_target       = df['Target'].sum()
+        total_realisasi    = df['Realisasi'].sum()
+        persen_keseluruhan = (total_realisasi / total_target * 100) if total_target > 0 else 0
+        c1.metric("Total Project",          len(df))
+        c2.metric("Target Rata-rata",       "100%")
+        c3.metric("Pencapaian Keseluruhan", f"{persen_keseluruhan:.1f}%")
         st.markdown("---")
-        st.markdown("**Tabel Detail Tracker**")
-        st.dataframe(df_tracker, use_container_width=True, height=420)
-    else:
-        st.warning("⚠️ Data tracker kosong.")
+
+        st.subheader("Visualisasi Analytics")
+        col_chart1, col_chart2 = st.columns(2)
+
+        with col_chart1:
+            st.markdown("**Status Keseluruhan (Total)**")
+            data_pie = pd.DataFrame({
+                'Status': ['Sudah Terealisasi', 'Sisa Target Belum Tercapai'],
+                'Nilai':  [total_realisasi, total_target - total_realisasi],
+            })
+            fig_pie = px.pie(data_pie, values='Nilai', names='Status', hole=0.4,
+                             color='Status', color_discrete_map={'Sudah Terealisasi': '#2ecc71', 'Sisa Target Belum Tercapai': '#e74c3c'})
+            fig_pie.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="center", x=0.5), margin=dict(t=50, b=0, l=0, r=0))
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        with col_chart2:
+            st.markdown("**Progress Spesifik per Project (On Progress & Pending)**")
+            df_filtered = df[df['Status'].isin(['On Progress', 'Pending'])].copy()
+            if not df_filtered.empty:
+                priority_map = {'High': 1, 'Medium': 2, 'Low': 3}
+                df_filtered['Priority_Rank'] = df_filtered['Prioritas'].map(priority_map).fillna(4)
+                df_filtered = df_filtered.sort_values(by=['Priority_Rank', 'Nama Project'], ascending=[False, False])
+                
+                df_melt = df_filtered.melt(id_vars='Nama Project', value_vars=['Target', 'Realisasi'], var_name='Kategori_Stat', value_name='Nilai (%)')
+                fig_bar = px.bar(df_melt, y='Nama Project', x='Nilai (%)', color='Kategori_Stat', barmode='group', orientation='h',
+                                 color_discrete_map={'Target': '#bdc3c7', 'Realisasi': '#3498db'})
+                fig_bar.update_layout(yaxis_title="", xaxis_title="Persentase (%)", legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="center", x=0.5), margin=dict(t=50, b=0, l=0, r=0))
+                st.plotly_chart(fig_bar, use_container_width=True)
+            else:
+                st.info("👍 Tidak ada project yang On Progress atau Pending.")
+
+        st.markdown("---")
+        st.subheader("Detail Status Project")
+        priority_map = {'High': 1, 'Medium': 2, 'Low': 3}
+        df_display = df.copy()
+        df_display['Priority_Rank'] = df_display['Prioritas'].map(priority_map).fillna(4)
+        df_display = df_display.sort_values(by=['Priority_Rank', 'Nama Project']).drop(columns=['Priority_Rank'])
+        st.dataframe(df_display, use_container_width=True)
+
+    # ── TAB 2 : LIHAT TRACKER LAINNYA ──
+    with tab2:
+        st.subheader("🗂️ Detail Tracker Terpilih")
+        selected_tracker = st.selectbox("Pilih Tracker yang ingin dilihat:", DAFTAR_TRACKER)
+        
+        df_tracker = load_tracker(selected_tracker)
+        
+        if not df_tracker.empty:
+            render_tracker_ringkasan(df_tracker, selected_tracker)
+            st.markdown("---")
+            st.markdown("**Tabel Detail Data**")
+            st.dataframe(df_tracker, use_container_width=True, height=420)
+        else:
+            st.warning("⚠️ Data tracker kosong.")
+
+    # ── TAB 3 : TIMELINE DSSP ──
+    with tab3:
+        st.subheader("📅 Timeline Interaktif DSSP")
+        st.write("Visualisasi Gantt Chart interaktif berdasarkan Sheet `Timeline`.")
+        
+        with st.spinner("Memuat Timeline..."):
+            df_timeline = load_timeline_dssp()
+        
+        if not df_timeline.empty:
+            end_col = 'Deadline Finish' if 'Deadline Finish' in df_timeline.columns else 'Deadline'
+            
+            if 'Start' in df_timeline.columns and end_col in df_timeline.columns:
+                
+                def parse_timeline_date(d):
+                    try:
+                        s = str(d).strip()
+                        if not s or s.lower() in ['nan', 'none', '-']: return pd.NaT
+                        if len(s) <= 6 and '-' in s: s += f"-{datetime.now().year}"
+                        return pd.to_datetime(s)
+                    except:
+                        return pd.NaT
+
+                df_timeline['Start_Parsed'] = df_timeline['Start'].apply(parse_timeline_date)
+                df_timeline['End_Parsed']   = df_timeline[end_col].apply(parse_timeline_date)
+                
+                df_plot = df_timeline.dropna(subset=['Start_Parsed', 'End_Parsed']).copy()
+                
+                if not df_plot.empty:
+                    # Format teks sumbu Y agar tidak berantakan
+                    def format_ylabel(row):
+                        task = str(row['Task']).strip()
+                        sub = str(row['Sub-Task']).strip()
+                        teks = f"{task} - {sub}" if sub and sub not in ['-', 'nan'] else task
+                        return teks[:40] + "..." if len(teks) > 40 else teks
+
+                    df_plot['Y_Label'] = df_plot.apply(format_ylabel, axis=1)
+                    
+                    # Kategorisasi Status
+                    today_date = pd.Timestamp(datetime.now().date())
+                    
+                    def tentukan_status(row):
+                        remark = str(row.get('Remark Status', '')).lower()
+                        end_date = row['End_Parsed']
+                        
+                        if any(k in remark for k in ['done', 'selesai', 'complete']):
+                            return "✅ Selesai"
+                        elif end_date < today_date:
+                            return "🚨 Overdue (Terlambat)"
+                        elif any(k in remark for k in ['progress', 'jalan']):
+                            return "🔄 On Progress"
+                        else:
+                            return "⏳ Pending / Belum Mulai"
+                    
+                    df_plot['Status Kategori'] = df_plot.apply(tentukan_status, axis=1)
+
+                    df_plot['Task Lengkap'] = df_plot['Task']
+                    df_plot['Sub-Task Lengkap'] = df_plot['Sub-Task']
+                    
+                    color_map = {
+                        "✅ Selesai": "#2ecc71",
+                        "🔄 On Progress": "#3498db",
+                        "🚨 Overdue (Terlambat)": "#e74c3c",
+                        "⏳ Pending / Belum Mulai": "#f1c40f"
+                    }
+
+                    # Render Chart
+                    dynamic_height = max(400, len(df_plot) * 35)
+
+                    fig_tl = px.timeline(
+                        df_plot, 
+                        x_start="Start_Parsed", 
+                        x_end="End_Parsed", 
+                        y="Y_Label", 
+                        color="Status Kategori",
+                        color_discrete_map=color_map,
+                        hover_data={
+                            "Task Lengkap": True, "Sub-Task Lengkap": True, "Remark Status": True, "PIC": True,
+                            "Start_Parsed": "|%d %b %Y", "End_Parsed": "|%d %b %Y", "Y_Label": False, "Status Kategori": False
+                        }, 
+                        title="Jadwal Pelaksanaan Project DSSP",
+                        height=dynamic_height
+                    )
+                    
+                    fig_tl.update_yaxes(autorange="reversed", title="")
+                    fig_tl.update_xaxes(title="Tanggal Pengerjaan")
+                    
+                    fig_tl.add_vline(x=datetime.now(), line_width=2, line_dash="dash", line_color="red", annotation_text="Hari Ini", annotation_position="top left")
+                    fig_tl.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, title=""), margin=dict(l=0, r=0, t=50, b=0))
+                    
+                    st.plotly_chart(fig_tl, use_container_width=True)
+                    
+                    # Panel Notifikasi Keterlambatan
+                    st.markdown("### ⚠️ Pantauan Keterlambatan Task")
+                    overdue_tasks = df_plot[df_plot['Status Kategori'] == "🚨 Overdue (Terlambat)"]
+                    
+                    if not overdue_tasks.empty:
+                        st.error(f"🚨 Terdapat {len(overdue_tasks)} Sub-Task yang melewati deadline!")
+                        st.dataframe(overdue_tasks[['Task', 'Sub-Task', end_col, 'Remark Status', 'PIC']].reset_index(drop=True), use_container_width=True)
+                    else:
+                        st.success("✅ Tepat Waktu! Seluruh pengerjaan masih dalam batas jadwal.")
+                else:
+                    st.warning("⚠️ Data tanggal pada Sheet Timeline tidak valid (Tidak dapat dibaca sistem).")
+            else:
+                st.warning("⚠️ Kolom 'Start' dan/atau 'Deadline Finish' tidak ditemukan di Sheet Timeline.")
+        else:
+            st.warning("⚠️ Sheet bernama 'Timeline' tidak ditemukan atau datanya kosong.")
 
 except Exception as e:
     st.error(f"Terjadi kesalahan sistem: {e}")
