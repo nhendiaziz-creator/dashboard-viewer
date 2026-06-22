@@ -14,7 +14,7 @@ ID_SPREADSHEET_TRACKER = '198lmRiSC1VjZeEL9CK11miLLQlBMQBjXKubEJMX0MO0'
 
 DAFTAR_TRACKER = [
     "Tracker KDS", "Tracker BGI", "Tracker Material",
-    "Tracker Nova", "Tracker RTMD Kemenkes",
+    "Tracker Nova", "Tracker RTMD Kemenkes", "Tracker KCS Batam"
 ]
 
 # ═══════════════════════════════════════════════════════════
@@ -59,7 +59,8 @@ def load_tracker(nama_tracker: str) -> pd.DataFrame:
         'no', 'nama', 'status', 'tanggal', 'kode', 'site', 'kategori', 'po', 'plan cost', 'actual cost',
         'progres', 'progress', 'target', 'realisasi', 'harga', 'cost', 'persentase',
         'revenue', 'margin', 'period', 'remark', 'deadline', 'prioritas',
-        'customer', 'spk', 'pekerjaan', 'tagihan', 'id', 'pic', 'assign'
+        'customer', 'spk', 'pekerjaan', 'tagihan', 'id', 'pic', 'assign',
+        'fase proyek', 'deskripsi', 'sistem', 'catatan', 'checklist'
     )
     best_idx, best_score = 0, -1
     for i, row in enumerate(raw[:15]):
@@ -276,6 +277,85 @@ def render_tracker_ringkasan(df: pd.DataFrame, tracker_name: str):
             fig.update_layout(xaxis_title="Period", yaxis_title="Revenue (Rp)", margin=dict(t=20, b=0))
             st.plotly_chart(fig, use_container_width=True)
 
+    # ====================================================================================
+    # UPDATE BARU: Visualisasi Khusus Tracker KCS Batam (Pipeline / Task Management)
+    # ====================================================================================
+    elif 'KCS Batam' in tracker_name:
+        col_fase   = _cari_kolom(cols, 'fase', 'phase')
+        col_status = _cari_kolom(cols, 'status')
+        col_prog   = _cari_kolom(cols, 'progres', 'progress')
+        col_pic    = _cari_kolom(cols, 'pic', 'penanggung jawab')
+        col_sistem = _cari_kolom(cols, 'sistem', 'system')
+
+        # 1. Row Metrik (Highlight Angka Penting)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("📋 Total Task Tersedia", len(df))
+        
+        if col_status:
+            done_count = len(df[df[col_status].astype(str).str.lower().isin(['done', 'selesai'])])
+            c2.metric("✅ Task Selesai", done_count)
+        else:
+            c2.metric("✅ Task Selesai", "N/A")
+
+        if col_prog:
+            # Hilangkan simbol '%' dan konversi ke numeric untuk mendapatkan rata-rata
+            prog_series = pd.to_numeric(df[col_prog].astype(str).str.replace('%', '', regex=False), errors='coerce').fillna(0)
+            avg_prog = prog_series.mean()
+            c3.metric("📈 Rata-rata Progress", f"{avg_prog:.1f}%")
+        else:
+            c3.metric("📈 Rata-rata Progress", "N/A")
+
+        st.markdown("---")
+        
+        # 2. Visualisasi Grafik Status
+        left, right = st.columns(2)
+        color_map_status = {
+            'Done': '#2ecc71', 'Selesai': '#2ecc71',
+            'On Progress': '#3498db', 'In Progress': '#3498db', 'Progress': '#3498db',
+            'Not Started': '#e74c3c', 'Belum Mulai': '#e74c3c'
+        }
+
+        if col_status:
+            with left:
+                st.markdown("**Status Keseluruhan Task**")
+                sc = df[col_status].replace(r'^\s*$', 'Unknown', regex=True).fillna('Unknown').value_counts().reset_index()
+                sc.columns = ['Status', 'Jumlah']
+                
+                fig_stat = px.pie(sc, values='Jumlah', names='Status', hole=0.4, color='Status', color_discrete_map=color_map_status)
+                fig_stat.update_layout(margin=dict(t=20, b=0))
+                st.plotly_chart(fig_stat, use_container_width=True)
+
+        if col_fase and col_status:
+            with right:
+                st.markdown("**Status Task per Fase Proyek**")
+                df_fase = df.groupby([col_fase, col_status]).size().reset_index(name='Jumlah')
+                fig_fase = px.bar(df_fase, x=col_fase, y='Jumlah', color=col_status, barmode='stack', color_discrete_map=color_map_status)
+                fig_fase.update_layout(xaxis_title="", yaxis_title="Jumlah Task", legend_title="", margin=dict(t=20, b=0))
+                st.plotly_chart(fig_fase, use_container_width=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        # 3. Visualisasi Pendukung: PIC & Sistem
+        l2, r2 = st.columns(2)
+        if col_pic:
+            with l2:
+                st.markdown("**Distribusi Beban Kerja PIC**")
+                pc = df[col_pic].replace(r'^\s*$', 'Unassigned', regex=True).fillna('Unassigned').value_counts().reset_index()
+                pc.columns = ['PIC', 'Jumlah Task']
+                fig_pic = px.bar(pc, x='PIC', y='Jumlah Task', color='PIC')
+                fig_pic.update_layout(showlegend=False, margin=dict(t=20, b=0), xaxis_title="")
+                st.plotly_chart(fig_pic, use_container_width=True)
+                
+        if col_sistem:
+            with r2:
+                st.markdown("**Distribusi Kategori Sistem**")
+                sys_c = df[col_sistem].replace(r'^\s*$', 'Unknown', regex=True).fillna('Unknown').value_counts().reset_index()
+                sys_c.columns = ['Sistem', 'Jumlah Task']
+                fig_sys = px.pie(sys_c, values='Jumlah Task', names='Sistem', hole=0.4)
+                fig_sys.update_layout(margin=dict(t=20, b=0))
+                st.plotly_chart(fig_sys, use_container_width=True)
+
+
     else:
         c1, c2 = st.columns(2)
         c1.metric("📋 Total Baris", len(df))
@@ -376,19 +456,14 @@ try:
             else:
                 st.info("👍 Tidak ada project yang On Progress atau Pending.")
 
-        # ====================================================================================
-        # UPDATE BARU: Distribusi Project per Company & Detail Remark/PIC
-        # ====================================================================================
         st.markdown("---")
         
-        # 1. Identifikasi Kolom secara Dinamis
         cols_main = df.columns.tolist()
         col_company = _cari_kolom(cols_main, 'company', 'perusahaan', 'klien', 'client')
         col_status  = _cari_kolom(cols_main, 'status') or 'Status'
         col_remark  = _cari_kolom(cols_main, 'remark', 'keterangan', 'catatan')
         col_pic     = _cari_kolom(cols_main, 'pic', 'penanggung jawab', 'assign', 'in charge')
         
-        # 2. Visualisasi Penyebaran Company (Bar Chart Grouped)
         st.subheader("🏢 Distribusi Status Project per Company")
         if col_company and col_status:
             df_comp = df.copy()
@@ -397,7 +472,6 @@ try:
             
             df_dist = df_comp.groupby([col_company, col_status]).size().reset_index(name='Jumlah Project')
             
-            # Mapping warna status standar
             color_map_status = {
                 'Done': '#2ecc71', 'Selesai': '#2ecc71', 'Closed': '#2ecc71',
                 'On Progress': '#3498db', 'In Progress': '#3498db', 'Progress': '#3498db',
@@ -414,19 +488,16 @@ try:
 
         st.markdown("---")
         
-        # 3. Tabel Detail Khusus Pending & On Progress (Dengan Remark & PIC)
         st.subheader("📋 Pantauan Khusus: Project On Progress & Pending")
         st.write("Daftar project aktif beserta *Remark* dan *PIC* untuk pemantauan.")
         
-        # Filter Project
         status_aktif = [s for s in df[col_status].dropna().unique() if any(k in str(s).lower() for k in ('progress', 'pending', 'hold', 'jalan'))]
         if not status_aktif:
-            status_aktif = ['On Progress', 'Pending'] # Fallback
+            status_aktif = ['On Progress', 'Pending'] 
             
         df_active = df[df[col_status].isin(status_aktif)].copy()
         
         if not df_active.empty:
-            # Menyusun kolom yang ingin ditampilkan agar rapi
             show_cols = ['Nama Project']
             if col_company: show_cols.append(col_company)
             show_cols.append(col_status)
@@ -434,20 +505,17 @@ try:
             if col_pic: show_cols.append(col_pic)
             if col_remark: show_cols.append(col_remark)
             
-            # Cek jika ada kolom prioritas untuk sorting
             col_prio = _cari_kolom(cols_main, 'prioritas', 'priority')
             if col_prio:
-                show_cols.insert(1, col_prio) # Masukkan prioritas setelah nama project
+                show_cols.insert(1, col_prio) 
                 priority_map = {'High': 1, 'Medium': 2, 'Low': 3}
                 df_active['Priority_Rank'] = df_active[col_prio].map(priority_map).fillna(4)
                 df_active = df_active.sort_values(by=['Priority_Rank', 'Nama Project']).drop(columns=['Priority_Rank'])
             
-            # Tampilkan dataframe tanpa index
             st.dataframe(df_active[show_cols], use_container_width=True, hide_index=True)
         else:
             st.success("✅ Hebat! Tidak ada project yang *On Progress* atau *Pending* saat ini (Semua sudah selesai).")
 
-        # Expander untuk melihat seluruh tabel jika diperlukan
         with st.expander("Lihat Seluruh Tabel Project Lengkap"):
             st.dataframe(df, use_container_width=True)
 
@@ -494,7 +562,6 @@ try:
                 df_plot = df_timeline.dropna(subset=['Start_Parsed', 'End_Parsed']).copy()
                 
                 if not df_plot.empty:
-                    # Format teks sumbu Y agar tidak berantakan
                     def format_ylabel(row):
                         task = str(row['Task']).strip()
                         sub = str(row['Sub-Task']).strip()
@@ -503,7 +570,6 @@ try:
 
                     df_plot['Y_Label'] = df_plot.apply(format_ylabel, axis=1)
                     
-                    # Kategorisasi Status
                     today_date = pd.Timestamp(datetime.now().date())
                     
                     def tentukan_status(row):
@@ -531,7 +597,6 @@ try:
                         "⏳ Pending / Belum Mulai": "#f1c40f"
                     }
 
-                    # Render Chart
                     dynamic_height = max(400, len(df_plot) * 35)
 
                     fig_tl = px.timeline(
@@ -557,7 +622,6 @@ try:
                     
                     st.plotly_chart(fig_tl, use_container_width=True)
                     
-                    # Panel Notifikasi Keterlambatan
                     st.markdown("### ⚠️ Pantauan Keterlambatan Task")
                     overdue_tasks = df_plot[df_plot['Status Kategori'] == "🚨 Overdue (Terlambat)"]
                     
