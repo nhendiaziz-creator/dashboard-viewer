@@ -116,7 +116,7 @@ def load_timeline_dssp():
     return df.reset_index(drop=True)
 
 # ═══════════════════════════════════════════════════════════
-# HELPER VISUALISASI TRACKER KHUSUS
+# HELPER VISUALISASI
 # ═══════════════════════════════════════════════════════════
 def parse_rupiah(series: pd.Series) -> pd.Series:
     return pd.to_numeric(
@@ -127,6 +127,7 @@ def parse_rupiah(series: pd.Series) -> pd.Series:
     ).fillna(0)
 
 def _cari_kolom(cols: list, *keywords: str):
+    """Mencari nama kolom aktual di dataframe berdasarkan kata kunci"""
     for kw in keywords:
         for c in cols:
             if kw.lower() in c.lower():
@@ -346,7 +347,7 @@ try:
         col_chart1, col_chart2 = st.columns(2)
 
         with col_chart1:
-            st.markdown("**Status Keseluruhan (Total)**")
+            st.markdown("**Status Keseluruhan (Total Target vs Realisasi)**")
             data_pie = pd.DataFrame({
                 'Status': ['Sudah Terealisasi', 'Sisa Target Belum Tercapai'],
                 'Nilai':  [total_realisasi, total_target - total_realisasi],
@@ -361,8 +362,11 @@ try:
             df_filtered = df[df['Status'].isin(['On Progress', 'Pending'])].copy()
             if not df_filtered.empty:
                 priority_map = {'High': 1, 'Medium': 2, 'Low': 3}
-                df_filtered['Priority_Rank'] = df_filtered['Prioritas'].map(priority_map).fillna(4)
-                df_filtered = df_filtered.sort_values(by=['Priority_Rank', 'Nama Project'], ascending=[False, False])
+                if 'Prioritas' in df_filtered.columns:
+                    df_filtered['Priority_Rank'] = df_filtered['Prioritas'].map(priority_map).fillna(4)
+                    df_filtered = df_filtered.sort_values(by=['Priority_Rank', 'Nama Project'], ascending=[False, False])
+                else:
+                    df_filtered = df_filtered.sort_values(by=['Nama Project'], ascending=[False])
                 
                 df_melt = df_filtered.melt(id_vars='Nama Project', value_vars=['Target', 'Realisasi'], var_name='Kategori_Stat', value_name='Nilai (%)')
                 fig_bar = px.bar(df_melt, y='Nama Project', x='Nilai (%)', color='Kategori_Stat', barmode='group', orientation='h',
@@ -372,13 +376,80 @@ try:
             else:
                 st.info("👍 Tidak ada project yang On Progress atau Pending.")
 
+        # ====================================================================================
+        # UPDATE BARU: Distribusi Project per Company & Detail Remark/PIC
+        # ====================================================================================
         st.markdown("---")
-        st.subheader("Detail Status Project")
-        priority_map = {'High': 1, 'Medium': 2, 'Low': 3}
-        df_display = df.copy()
-        df_display['Priority_Rank'] = df_display['Prioritas'].map(priority_map).fillna(4)
-        df_display = df_display.sort_values(by=['Priority_Rank', 'Nama Project']).drop(columns=['Priority_Rank'])
-        st.dataframe(df_display, use_container_width=True)
+        
+        # 1. Identifikasi Kolom secara Dinamis
+        cols_main = df.columns.tolist()
+        col_company = _cari_kolom(cols_main, 'company', 'perusahaan', 'klien', 'client')
+        col_status  = _cari_kolom(cols_main, 'status') or 'Status'
+        col_remark  = _cari_kolom(cols_main, 'remark', 'keterangan', 'catatan')
+        col_pic     = _cari_kolom(cols_main, 'pic', 'penanggung jawab', 'assign', 'in charge')
+        
+        # 2. Visualisasi Penyebaran Company (Bar Chart Grouped)
+        st.subheader("🏢 Distribusi Status Project per Company")
+        if col_company and col_status:
+            df_comp = df.copy()
+            df_comp[col_company] = df_comp[col_company].replace(r'^\s*$', 'Lainnya/Kosong', regex=True).fillna('Lainnya/Kosong')
+            df_comp[col_status]  = df_comp[col_status].replace(r'^\s*$', 'Unknown', regex=True).fillna('Unknown')
+            
+            df_dist = df_comp.groupby([col_company, col_status]).size().reset_index(name='Jumlah Project')
+            
+            # Mapping warna status standar
+            color_map_status = {
+                'Done': '#2ecc71', 'Selesai': '#2ecc71', 'Closed': '#2ecc71',
+                'On Progress': '#3498db', 'In Progress': '#3498db', 'Progress': '#3498db',
+                'Pending': '#e74c3c', 'Hold': '#e74c3c', 'Belum Mulai': '#f1c40f'
+            }
+            
+            fig_comp = px.bar(df_dist, x=col_company, y='Jumlah Project', color=col_status, 
+                              barmode='group', text='Jumlah Project', color_discrete_map=color_map_status)
+            fig_comp.update_traces(textposition='outside')
+            fig_comp.update_layout(xaxis_title="Company", yaxis_title="Jumlah Project", legend_title="Status", margin=dict(t=20, b=0))
+            st.plotly_chart(fig_comp, use_container_width=True)
+        else:
+            st.info("⚠️ Kolom 'Company' atau sejenisnya tidak ditemukan di sheet utama untuk membuat grafik distribusi.")
+
+        st.markdown("---")
+        
+        # 3. Tabel Detail Khusus Pending & On Progress (Dengan Remark & PIC)
+        st.subheader("📋 Pantauan Khusus: Project On Progress & Pending")
+        st.write("Daftar project aktif beserta *Remark* dan *PIC* untuk pemantauan.")
+        
+        # Filter Project
+        status_aktif = [s for s in df[col_status].dropna().unique() if any(k in str(s).lower() for k in ('progress', 'pending', 'hold', 'jalan'))]
+        if not status_aktif:
+            status_aktif = ['On Progress', 'Pending'] # Fallback
+            
+        df_active = df[df[col_status].isin(status_aktif)].copy()
+        
+        if not df_active.empty:
+            # Menyusun kolom yang ingin ditampilkan agar rapi
+            show_cols = ['Nama Project']
+            if col_company: show_cols.append(col_company)
+            show_cols.append(col_status)
+            show_cols.append('Realisasi')
+            if col_pic: show_cols.append(col_pic)
+            if col_remark: show_cols.append(col_remark)
+            
+            # Cek jika ada kolom prioritas untuk sorting
+            col_prio = _cari_kolom(cols_main, 'prioritas', 'priority')
+            if col_prio:
+                show_cols.insert(1, col_prio) # Masukkan prioritas setelah nama project
+                priority_map = {'High': 1, 'Medium': 2, 'Low': 3}
+                df_active['Priority_Rank'] = df_active[col_prio].map(priority_map).fillna(4)
+                df_active = df_active.sort_values(by=['Priority_Rank', 'Nama Project']).drop(columns=['Priority_Rank'])
+            
+            # Tampilkan dataframe tanpa index
+            st.dataframe(df_active[show_cols], use_container_width=True, hide_index=True)
+        else:
+            st.success("✅ Hebat! Tidak ada project yang *On Progress* atau *Pending* saat ini (Semua sudah selesai).")
+
+        # Expander untuk melihat seluruh tabel jika diperlukan
+        with st.expander("Lihat Seluruh Tabel Project Lengkap"):
+            st.dataframe(df, use_container_width=True)
 
     # ── TAB 2 : LIHAT TRACKER LAINNYA ──
     with tab2:
