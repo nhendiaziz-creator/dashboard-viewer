@@ -90,10 +90,66 @@ def _cari_kolom(cols, *keywords):
     return None
 
 
-# ═══════════════════════════════════════════════════════════
-# LOAD TRACKER (generik, per project)
-# ═══════════════════════════════════════════════════════════
-@st.cache_data(ttl=60)
+def parse_rupiah(series):
+    """Konversi kolom teks nominal (mis. 'Rp 500.000', '500000', '45,000') ke numeric."""
+    return pd.to_numeric(
+        series.astype(str)
+              .str.replace(r'[Rp\s\.]', '', regex=True)
+              .str.replace(',', '', regex=False),
+        errors='coerce'
+    ).fillna(0)
+
+
+def compute_margin(df, nama_project):
+    """Hitung rincian revenue/cost/margin per baris untuk KDS & Nova.
+    Kembalikan (df_rincian, total_rev, total_cost, total_margin) atau (None, ...) bila N/A.
+    - KDS : pakai kolom Revenue, Cost, Margin yg sudah ada.
+    - Nova: Revenue = PO, Cost = Actual Cost, Margin = PO - Actual Cost.
+    """
+    if df.empty:
+        return None, 0, 0, 0
+    cols = df.columns.tolist()
+
+    if 'KDS' in nama_project:
+        col_rev  = _cari_kolom(cols, 'revenue')
+        col_cost = next((c for c in cols if c.strip().lower() == 'cost'), None) or _cari_kolom(cols, 'cost')
+        col_margin = next((c for c in cols if c.strip().lower() == 'margin'), None)
+        col_label = _cari_kolom(cols, 'kerjaan', 'customer', 'assignment')
+        if not (col_rev and col_cost):
+            return None, 0, 0, 0
+        rev = parse_rupiah(df[col_rev])
+        cost = parse_rupiah(df[col_cost])
+        margin = parse_rupiah(df[col_margin]) if col_margin else (rev - cost)
+        label = df[col_label].astype(str) if col_label else pd.Series(range(len(df))).astype(str)
+
+    elif 'Nova' in nama_project:
+        col_po = next((c for c in cols if c.strip().lower() == 'po'), None) or _cari_kolom(cols, 'po')
+        col_ac = _cari_kolom(cols, 'actual cost')
+        col_label = _cari_kolom(cols, 'nama entitas', 'nama daerah', 'entitas', 'daerah')
+        if not (col_po and col_ac):
+            return None, 0, 0, 0
+        rev = parse_rupiah(df[col_po])
+        cost = parse_rupiah(df[col_ac])
+        margin = rev - cost
+        label = df[col_label].astype(str) if col_label else pd.Series(range(len(df))).astype(str)
+
+    else:
+        return None, 0, 0, 0
+
+    rincian = pd.DataFrame({
+        'Lokasi': label.values,
+        'Revenue': rev.values,
+        'Cost': cost.values,
+        'Margin': margin.values,
+    })
+    # buang baris yg semua nilainya nol (baris kosong padding)
+    rincian = rincian[(rincian['Revenue'] != 0) | (rincian['Cost'] != 0) | (rincian['Margin'] != 0)]
+    rincian['Margin %'] = rincian.apply(
+        lambda r: (r['Margin'] / r['Revenue'] * 100) if r['Revenue'] else 0, axis=1)
+    return (rincian.reset_index(drop=True),
+            float(rincian['Revenue'].sum()),
+            float(rincian['Cost'].sum()),
+            float(rincian['Margin'].sum()))
 def load_tracker(nama_sheet: str) -> pd.DataFrame:
     gc = _get_client()
     sh = gc.open_by_key(ID_SPREADSHEET_TRACKER)
@@ -431,7 +487,13 @@ try:
     st.subheader("🔍 Detail Data per Project")
     for nama, d in data.items():
         with st.expander(f"{nama} — {d['persen']:.0f}% selesai · {d['iss_open']} issue open"):
-            tab_t, tab_i, tab_s = st.tabs(["📋 Tracker", "🐞 Issue Log", "📊 Breakdown Status"])
+            punya_margin = ('KDS' in nama) or ('Nova' in nama)
+            if punya_margin:
+                tab_t, tab_i, tab_s, tab_m = st.tabs(
+                    ["📋 Tracker", "🐞 Issue Log", "📊 Breakdown Status", "💰 Margin Profit"])
+            else:
+                tab_t, tab_i, tab_s = st.tabs(
+                    ["📋 Tracker", "🐞 Issue Log", "📊 Breakdown Status"])
 
             with tab_t:
                 if not d["df_track"].empty:
@@ -465,6 +527,52 @@ try:
                     st.plotly_chart(fig_bd, use_container_width=True)
                 else:
                     st.info("Tidak ada data status untuk ditampilkan.")
+
+            if punya_margin:
+                with tab_m:
+                    rincian, tot_rev, tot_cost, tot_margin = compute_margin(d["df_track"], nama)
+                    if rincian is None or rincian.empty:
+                        st.info("Data revenue/cost tidak tersedia untuk menghitung margin.")
+                    else:
+                        if 'Nova' in nama:
+                            st.caption("ℹ️ Nova: Revenue = PO, Cost = Actual Cost, "
+                                       "Margin = PO − Actual Cost.")
+                        else:
+                            st.caption("ℹ️ KDS: Revenue, Cost, dan Margin dari kolom tracker.")
+
+                        pct = (tot_margin / tot_rev * 100) if tot_rev else 0
+                        mk1, mk2, mk3, mk4 = st.columns(4)
+                        mk1.metric("💰 Total Revenue", f"Rp {tot_rev:,.0f}")
+                        mk2.metric("📉 Total Cost", f"Rp {tot_cost:,.0f}")
+                        mk3.metric("📈 Total Margin", f"Rp {tot_margin:,.0f}")
+                        mk4.metric("📊 Margin %", f"{pct:.1f}%")
+
+                        # Peringatan bila ada lokasi rugi (margin negatif)
+                        rugi = rincian[rincian['Margin'] < 0]
+                        if not rugi.empty:
+                            st.warning(f"⚠️ {len(rugi)} lokasi margin negatif (rugi). "
+                                       "Cek tabel di bawah.")
+
+                        # Grafik margin per lokasi (hijau = untung, merah = rugi)
+                        viz = rincian.sort_values('Margin').copy()
+                        viz['Warna'] = viz['Margin'].apply(
+                            lambda v: 'Rugi' if v < 0 else 'Untung')
+                        fig_m = px.bar(
+                            viz, x='Margin', y='Lokasi', orientation='h', color='Warna',
+                            color_discrete_map={'Untung': '#2ecc71', 'Rugi': '#e74c3c'},
+                            height=max(320, len(viz) * 28),
+                        )
+                        fig_m.update_layout(
+                            showlegend=False, yaxis_title="", xaxis_title="Margin (Rp)",
+                            margin=dict(t=10, b=0))
+                        st.plotly_chart(fig_m, use_container_width=True)
+
+                        # Tabel rincian
+                        tampil = rincian.copy()
+                        for c in ['Revenue', 'Cost', 'Margin']:
+                            tampil[c] = tampil[c].map(lambda v: f"Rp {v:,.0f}")
+                        tampil['Margin %'] = rincian['Margin %'].map(lambda v: f"{v:.1f}%")
+                        st.dataframe(tampil, use_container_width=True, hide_index=True, height=300)
 
 except Exception as e:
     st.error(f"Terjadi kesalahan sistem: {e}")
