@@ -399,7 +399,9 @@ try:
         col_status = _cari_kolom(df_iss.columns, 'status')
         col_desc = _cari_kolom(df_iss.columns, 'deskripsi', 'description', 'issue')
         col_pic = _cari_kolom(df_iss.columns, 'pic', 'penanggung')
-        col_remark = _cari_kolom(df_iss.columns, 'remark', 'keterangan', 'need support')
+        # 'remark (close)' harus menang; 'need support' TIDAK boleh dianggap remark
+        col_remark = _cari_kolom(df_iss.columns, 'remark (close)', 'remark', 'keterangan', 'catatan')
+        col_support = _cari_kolom(df_iss.columns, 'need support', 'support')
         col_tgl = _cari_kolom(df_iss.columns, 'tanggal', 'date')
         if not col_status:
             continue
@@ -410,6 +412,7 @@ try:
                 "Tanggal": str(r[col_tgl]) if col_tgl else "",
                 "Deskripsi": str(r[col_desc]) if col_desc else "",
                 "PIC": str(r[col_pic]) if col_pic else "",
+                "Need Support": str(r[col_support]) if col_support else "",
                 "Remark": str(r[col_remark]) if col_remark else "",
             })
 
