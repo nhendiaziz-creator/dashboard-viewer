@@ -42,12 +42,18 @@ PROJECTS = {
         "progress_mode": "status",
         "warna": "#1abc9c",
     },
+    "Uniqlo": {
+        "tracker_sheet": "Tracker VOIP Uniqlo",
+        "issue_sheet":   "ISSUE LOG Uniqlo",
+        "progress_mode": "status",
+        "warna": "#e74c3c",
+    },
 }
 
 # Nilai status yang dianggap "selesai" (lower-case matching)
 STATUS_SELESAI = ('done', 'selesai', 'closed', 'invoiced', 'close', 'complete')
 # Nilai status yang dianggap "belum mulai / tidak dihitung sebagai aktif"
-STATUS_BELUM = ('tbd', 'nys', 'not yet', 'belum', 'pending')
+STATUS_BELUM = ('tbd', 'nys', 'not yet', 'not started', 'belum', 'pending')
 
 
 # ═══════════════════════════════════════════════════════════
@@ -150,6 +156,78 @@ def compute_margin(df, nama_project):
             float(rincian['Revenue'].sum()),
             float(rincian['Cost'].sum()),
             float(rincian['Margin'].sum()))
+def compute_cost_health(df, nama_project):
+    """Analisa kepatuhan anggaran (Plan vs Actual Cost) untuk cross-subsidy.
+
+    Berbeda dari compute_margin (yg bicara revenue vs cost / profitabilitas).
+    Di sini fokusnya: apakah actual cost masih di dalam plan, dan apakah
+    lokasi yg overcost masih bisa ditutup oleh sisa anggaran (headroom) dari
+    lokasi yg undercost.
+
+    Return dict:
+      realized     : DataFrame lokasi yg sudah punya Actual Cost (>0)
+      unrealized   : DataFrame lokasi yg Actual Cost masih kosong
+      plan_real    : total plan dari lokasi terealisasi
+      actual_real  : total actual dari lokasi terealisasi
+      headroom     : plan_real - actual_real (positif = masih ada sisa pool)
+      over_total   : total nilai kelebihan biaya dari lokasi overcost saja
+      n_over       : jumlah lokasi overcost
+    Atau None bila kolom tak tersedia.
+    """
+    if df.empty:
+        return None
+    cols = df.columns.tolist()
+    col_plan   = _cari_kolom(cols, 'plan cost')
+    col_actual = _cari_kolom(cols, 'actual cost')
+    col_label  = _cari_kolom(cols, 'store', 'lokasi', 'site', 'nama')
+    col_city   = _cari_kolom(cols, 'city', 'kota', 'daerah')
+    if not (col_plan and col_actual):
+        return None
+
+    plan   = parse_rupiah(df[col_plan])
+    actual = parse_rupiah(df[col_actual])
+    label  = (df[col_label].astype(str) if col_label
+              else pd.Series(range(len(df))).astype(str))
+    city   = df[col_city].astype(str) if col_city else pd.Series([''] * len(df))
+
+    base = pd.DataFrame({
+        'Lokasi': label.values,
+        'Kota':   city.values,
+        'Plan':   plan.values,
+        'Actual': actual.values,
+    })
+    # buang baris padding kosong (tanpa nama & tanpa plan)
+    base = base[(base['Lokasi'].str.strip() != '') & (base['Plan'] != 0)]
+
+    # Lokasi "terealisasi" = actual sudah diisi (>0). Actual==0 dianggap belum,
+    # sesuai keputusan: lokasi belum realisasi ditampilkan terpisah.
+    realized   = base[base['Actual'] > 0].copy()
+    unrealized = base[base['Actual'] <= 0].copy()
+
+    if not realized.empty:
+        realized['Variance'] = realized['Actual'] - realized['Plan']   # + = overcost
+        realized['Variance %'] = realized.apply(
+            lambda r: (r['Variance'] / r['Plan'] * 100) if r['Plan'] else 0, axis=1)
+        realized['Kondisi'] = realized['Variance'].apply(
+            lambda v: 'Overcost' if v > 0 else ('Undercost' if v < 0 else 'Tepat'))
+
+    plan_real   = float(realized['Plan'].sum())   if not realized.empty else 0.0
+    actual_real = float(realized['Actual'].sum()) if not realized.empty else 0.0
+    headroom    = plan_real - actual_real
+    over_total  = float(realized.loc[realized['Variance'] > 0, 'Variance'].sum()) \
+                  if not realized.empty else 0.0
+    n_over      = int((realized['Variance'] > 0).sum()) if not realized.empty else 0
+
+    return {
+        'realized': realized.reset_index(drop=True),
+        'unrealized': unrealized.reset_index(drop=True),
+        'plan_real': plan_real,
+        'actual_real': actual_real,
+        'headroom': headroom,
+        'over_total': over_total,
+        'n_over': n_over,
+    }
+    
 def load_tracker(nama_sheet: str) -> pd.DataFrame:
     gc = _get_client()
     sh = gc.open_by_key(ID_SPREADSHEET_TRACKER)
@@ -488,13 +566,17 @@ try:
     for nama, d in data.items():
         with st.expander(f"{nama} — {d['persen']:.0f}% selesai · {d['iss_open']} issue open"):
             punya_margin = ('KDS' in nama) or ('Nova' in nama)
+            punya_cost_health = ('Uniqlo' in nama)
             if punya_margin:
                 tab_t, tab_i, tab_s, tab_m = st.tabs(
                     ["📋 Tracker", "🐞 Issue Log", "📊 Breakdown Status", "💰 Margin Profit"])
+            elif punya_cost_health:
+                tab_t, tab_i, tab_s, tab_c = st.tabs(
+                    ["📋 Tracker", "🐞 Issue Log", "📊 Breakdown Status", "💵 Kesehatan Cost"])
             else:
                 tab_t, tab_i, tab_s = st.tabs(
                     ["📋 Tracker", "🐞 Issue Log", "📊 Breakdown Status"])
-
+                
             with tab_t:
                 if not d["df_track"].empty:
                     st.dataframe(d["df_track"], use_container_width=True, height=360)
@@ -573,6 +655,102 @@ try:
                             tampil[c] = tampil[c].map(lambda v: f"Rp {v:,.0f}")
                         tampil['Margin %'] = rincian['Margin %'].map(lambda v: f"{v:.1f}%")
                         st.dataframe(tampil, use_container_width=True, hide_index=True, height=300)
+            if punya_cost_health:
+                with tab_c:
+                    ch = compute_cost_health(d["df_track"], nama)
+                    if ch is None:
+                        st.info("Kolom Plan Cost / Actual Cost tidak ditemukan di tracker.")
+                    else:
+                        st.caption(
+                            "ℹ️ Kesehatan cost = Plan vs Actual. **Headroom pool** = "
+                            "Σ Plan − Σ Actual dari lokasi yg SUDAH realisasi. Selama headroom "
+                            "positif, lokasi overcost masih bisa disubsidi silang oleh lokasi "
+                            "undercost. Lokasi tanpa Actual Cost belum dihitung (lihat sub-tabel)."
+                        )
+
+                        real = ch['realized']
+                        if real.empty:
+                            st.warning(
+                                "⏳ Belum ada lokasi dengan Actual Cost terisi. "
+                                f"Semua {len(ch['unrealized'])} lokasi masih *belum realisasi*, "
+                                "jadi kesehatan cost belum bisa dihitung. Panel ini akan aktif "
+                                "begitu kolom **Actual Cost** mulai diisi."
+                            )
+                        else:
+                            c1, c2, c3, c4 = st.columns(4)
+                            c1.metric("💰 Plan (realisasi)", f"Rp {ch['plan_real']:,.0f}")
+                            c2.metric("💸 Actual (realisasi)", f"Rp {ch['actual_real']:,.0f}")
+                            c3.metric(
+                                "🏦 Headroom Pool",
+                                f"Rp {ch['headroom']:,.0f}",
+                                delta=("sisa anggaran" if ch['headroom'] >= 0
+                                       else "pool defisit"),
+                                delta_color=("normal" if ch['headroom'] >= 0 else "inverse"),
+                            )
+                            c4.metric("🔴 Lokasi Overcost", ch['n_over'])
+
+                            # Inti keputusan subsidi silang
+                            if ch['n_over'] == 0:
+                                st.success(
+                                    "✅ Tidak ada lokasi overcost. Semua realisasi di bawah/tepat plan."
+                                )
+                            elif ch['headroom'] >= 0:
+                                st.success(
+                                    f"✅ {ch['n_over']} lokasi overcost (total kelebihan "
+                                    f"Rp {ch['over_total']:,.0f}), TAPI masih tertutup headroom "
+                                    f"Rp {ch['headroom']:,.0f}. Subsidi silang layak — "
+                                    "pool anggaran agregat masih surplus."
+                                )
+                            else:
+                                st.error(
+                                    f"⚠️ {ch['n_over']} lokasi overcost (total kelebihan "
+                                    f"Rp {ch['over_total']:,.0f}) dan headroom sudah defisit "
+                                    f"Rp {ch['headroom']:,.0f}. Overcost TIDAK lagi tertutup "
+                                    "oleh lokasi undercost — perlu tambahan anggaran / evaluasi."
+                                )
+
+                            # Grafik variance per lokasi (merah=overcost, hijau=undercost)
+                            viz = real.sort_values('Variance').copy()
+                            fig_c = px.bar(
+                                viz, x='Variance', y='Lokasi', orientation='h',
+                                color='Kondisi',
+                                color_discrete_map={
+                                    'Overcost': '#e74c3c',
+                                    'Undercost': '#2ecc71',
+                                    'Tepat': '#95a5a6',
+                                },
+                                height=max(320, len(viz) * 28),
+                                labels={'Variance': 'Selisih Actual − Plan (Rp)'},
+                            )
+                            fig_c.update_layout(
+                                yaxis_title="", xaxis_title="Selisih thd Plan (Rp) · + = overcost",
+                                legend_title="", margin=dict(t=10, b=0),
+                                legend=dict(orientation="h", yanchor="bottom",
+                                            y=1.02, xanchor="right", x=1),
+                            )
+                            fig_c.add_vline(x=0, line_width=1, line_color="#333")
+                            st.plotly_chart(fig_c, use_container_width=True)
+
+                            # Tabel lokasi terealisasi
+                            tampil_r = real[['Lokasi', 'Kota', 'Plan', 'Actual',
+                                             'Variance', 'Variance %', 'Kondisi']].copy()
+                            for c in ['Plan', 'Actual', 'Variance']:
+                                tampil_r[c] = tampil_r[c].map(lambda v: f"Rp {v:,.0f}")
+                            tampil_r['Variance %'] = real['Variance %'].map(
+                                lambda v: f"{v:+.1f}%")
+                            st.markdown("**Lokasi sudah realisasi**")
+                            st.dataframe(tampil_r, use_container_width=True,
+                                         hide_index=True, height=280)
+
+                        # Sub-tabel: lokasi belum realisasi (selalu tampil bila ada)
+                        unreal = ch['unrealized']
+                        if not unreal.empty:
+                            st.markdown(f"**⏳ Belum realisasi ({len(unreal)} lokasi)** "
+                                        "— Actual Cost belum diisi, tidak masuk hitungan headroom")
+                            tampil_u = unreal[['Lokasi', 'Kota', 'Plan']].copy()
+                            tampil_u['Plan'] = tampil_u['Plan'].map(lambda v: f"Rp {v:,.0f}")
+                            tampil_u['Actual'] = "— belum diisi —"
+                            st.dataframe(tampil_u, use_container_width=True,hide_index=True, height=240)
 
 except Exception as e:
     st.error(f"Terjadi kesalahan sistem: {e}")
