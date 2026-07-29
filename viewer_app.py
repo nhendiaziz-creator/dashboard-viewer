@@ -4,6 +4,15 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
+from io import BytesIO
+
+# --- dependensi ekspor PPTX (pip install python-pptx) ---
+from pptx import Presentation
+from pptx.util import Inches, Pt, Emu
+from pptx.dml.color import RGBColor
+from pptx.chart.data import CategoryChartData
+from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION, XL_LABEL_POSITION
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 
 st.set_page_config(page_title="Dashboard Overview Project", layout="wide")
 
@@ -156,6 +165,8 @@ def compute_margin(df, nama_project):
             float(rincian['Revenue'].sum()),
             float(rincian['Cost'].sum()),
             float(rincian['Margin'].sum()))
+
+
 def compute_cost_health(df, nama_project):
     """Analisa kepatuhan anggaran (Plan vs Actual Cost) untuk cross-subsidy.
 
@@ -227,8 +238,10 @@ def compute_cost_health(df, nama_project):
         'over_total': over_total,
         'n_over': n_over,
     }
-    
-def load_tracker(nama_sheet: str) -> pd.DataFrame:
+
+
+@st.cache_data(ttl=60)          # FIX: sebelumnya tanpa decorator, jadi
+def load_tracker(nama_sheet: str) -> pd.DataFrame:   # load_tracker.clear() error
     gc = _get_client()
     sh = gc.open_by_key(ID_SPREADSHEET_TRACKER)
     try:
@@ -380,13 +393,438 @@ def hitung_issue(df: pd.DataFrame):
 
 
 # ═══════════════════════════════════════════════════════════
+# EKSPOR PPTX
+# ═══════════════════════════════════════════════════════════
+# Chart dibuat NATIVE PowerPoint (bukan gambar Plotly), jadi tidak butuh
+# kaleido / headless Chrome dan hasilnya bisa diedit langsung di PowerPoint.
+
+INK      = RGBColor(0x1B, 0x24, 0x30)   # teks utama / background cover
+INK_SOFT = RGBColor(0x44, 0x50, 0x5E)
+MUTED    = RGBColor(0x76, 0x82, 0x8F)
+LINE     = RGBColor(0xDD, 0xE2, 0xE7)
+PAPER    = RGBColor(0xFF, 0xFF, 0xFF)
+BAND     = RGBColor(0xF4, 0xF6, 0xF8)
+OK       = RGBColor(0x2E, 0x9E, 0x5B)
+WARN     = RGBColor(0xD9, 0x82, 0x2B)
+BAD      = RGBColor(0xC0, 0x39, 0x2B)
+
+MAX_ROW_PER_SLIDE = 7    # baris tabel isu per slide
+DESC_MAX = 95            # potong deskripsi isu biar tidak overflow
+
+BULAN_ID = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
+            "Agustus", "September", "Oktober", "November", "Desember"]
+
+
+def _hex_to_rgb(h):
+    h = str(h).lstrip("#")
+    try:
+        return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    except Exception:
+        return MUTED
+
+
+def _potong(teks, n=DESC_MAX):
+    t = " ".join(str(teks).split())
+    return t if len(t) <= n else t[: n - 1].rstrip() + "…"
+
+
+def _tanggal(v):
+    """Normalkan nilai tanggal (Sheets sering mengirim '2026-07-23 00:00:00')."""
+    t = str(v).strip()
+    if not t or t.lower() in ("nan", "nat", "none"):
+        return "—"
+    try:
+        # '2026-07-23...' = ISO (bulan di tengah); '23/07/2026' = hari di depan
+        dayfirst = not t[:4].isdigit()
+        return pd.to_datetime(t, errors="raise", dayfirst=dayfirst).strftime("%d %b %Y")
+    except Exception:
+        return _potong(t, 12)
+
+
+def _txt(slide, x, y, w, h, teks, size=14, bold=False, color=INK,
+         align=PP_ALIGN.LEFT, anchor=MSO_ANCHOR.TOP, spacing=None):
+    box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+    tf = box.text_frame
+    tf.word_wrap = True
+    tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
+    tf.vertical_anchor = anchor
+    p = tf.paragraphs[0]
+    p.alignment = align
+    if spacing:
+        p.line_spacing = spacing
+    r = p.add_run()
+    r.text = str(teks)
+    r.font.size = Pt(size)
+    r.font.bold = bold
+    r.font.color.rgb = color
+    r.font.name = "Calibri"
+    return box
+
+
+def _slide_kosong(prs):
+    return prs.slides.add_slide(prs.slide_layouts[6])   # blank layout
+
+
+def _header(slide, kicker, judul, no_halaman=None):
+    """Header standar: kicker kecil di atas, judul besar."""
+    _txt(slide, 0.7, 0.45, 11.9, 0.28, kicker.upper(), size=11, bold=True, color=MUTED)
+    _txt(slide, 0.7, 0.78, 11.9, 0.55, judul, size=26, bold=True, color=INK)
+    if no_halaman is not None:
+        _txt(slide, 12.0, 6.95, 0.6, 0.3, str(no_halaman), size=10,
+             color=MUTED, align=PP_ALIGN.RIGHT)
+
+
+def _kpi(slide, x, y, w, angka, label, warna=INK):
+    _txt(slide, x, y, w, 0.75, angka, size=40, bold=True, color=warna)
+    _txt(slide, x, y + 0.72, w, 0.55, label, size=11, color=MUTED)
+
+
+def _tabel(slide, x, y, w, header, rows, col_w=None, font=10.5,
+           warna_kolom_status=None):
+    """Tabel rapi tanpa style bawaan PowerPoint."""
+    n_r, n_c = len(rows) + 1, len(header)
+    h = Inches(0.38 + 0.34 * len(rows))
+    shp = slide.shapes.add_table(n_r, n_c, Inches(x), Inches(y), Inches(w), h)
+    tbl = shp.table
+    tbl.first_row = True
+    tbl.horz_banding = False
+
+    if col_w:
+        total = sum(col_w)
+        for i, cw in enumerate(col_w):
+            tbl.columns[i].width = Emu(int(Inches(w) * cw / total))
+
+    tbl.rows[0].height = Inches(0.38)
+    for j, teks in enumerate(header):
+        c = tbl.cell(0, j)
+        c.text = str(teks)
+        c.fill.solid()
+        c.fill.fore_color.rgb = INK
+        c.margin_left = c.margin_right = Inches(0.08)
+        c.vertical_anchor = MSO_ANCHOR.MIDDLE
+        p = c.text_frame.paragraphs[0]
+        p.font.size = Pt(font)
+        p.font.bold = True
+        p.font.color.rgb = PAPER
+        p.font.name = "Calibri"
+
+    for i, row in enumerate(rows, start=1):
+        tbl.rows[i].height = Inches(0.34)
+        for j, teks in enumerate(row):
+            c = tbl.cell(i, j)
+            c.text = str(teks)
+            c.fill.solid()
+            c.fill.fore_color.rgb = PAPER if i % 2 else BAND
+            c.margin_left = c.margin_right = Inches(0.08)
+            c.vertical_anchor = MSO_ANCHOR.MIDDLE
+            p = c.text_frame.paragraphs[0]
+            p.font.size = Pt(font)
+            p.font.name = "Calibri"
+            p.font.color.rgb = INK_SOFT
+            if warna_kolom_status is not None and j == warna_kolom_status:
+                p.font.bold = True
+                p.font.color.rgb = BAD if "open" in str(teks).lower() else OK
+    return shp
+
+
+def _rapikan_chart(chart, label_size=10):
+    chart.font.size = Pt(10)
+    chart.font.name = "Calibri"
+    chart.font.color.rgb = INK_SOFT
+    chart.has_title = False
+    try:
+        chart.value_axis.has_major_gridlines = True
+        chart.value_axis.major_gridlines.format.line.color.rgb = LINE
+        chart.value_axis.major_gridlines.format.line.width = Pt(0.5)
+        chart.category_axis.has_major_gridlines = False
+        chart.value_axis.tick_labels.font.size = Pt(label_size)
+        chart.category_axis.tick_labels.font.size = Pt(label_size)
+    except Exception:
+        pass
+
+
+def _slide_cover(prs, data, judul, tanggal):
+    s = _slide_kosong(prs)
+    bg = s.background
+    bg.fill.solid()
+    bg.fill.fore_color.rgb = INK
+
+    total_issue = sum(d["iss_total"] for d in data.values())
+    total_open = sum(d["iss_open"] for d in data.values())
+    avg = sum(d["persen"] for d in data.values()) / len(data) if data else 0
+
+    _txt(s, 0.9, 1.05, 11.5, 0.3, "PROGRESS & ISSUE REPORT", size=12,
+         bold=True, color=RGBColor(0x8E, 0x9B, 0xA8))
+    _txt(s, 0.9, 1.55, 9.5, 1.9, judul, size=44, bold=True, color=PAPER, spacing=1.05)
+    _txt(s, 0.9, 3.55, 9.5, 0.35,
+         f"{len(data)} proyek dalam pengawalan   |   Data per {tanggal}",
+         size=13, color=RGBColor(0xA8, 0xB4, 0xC0))
+
+    kpis = [
+        (f"{avg:.0f}%", "rata-rata progres"),
+        (str(total_open), "isu terbuka"),
+        (str(total_issue), "total isu tercatat"),
+        (str(len(data)), "proyek aktif"),
+    ]
+    for i, (angka, label) in enumerate(kpis):
+        x = 0.9 + i * 2.95
+        _txt(s, x, 4.5, 2.7, 0.8, angka, size=38, bold=True,
+             color=BAD if label == "isu terbuka" and total_open else PAPER)
+        _txt(s, x, 5.32, 2.7, 0.4, label, size=11, color=RGBColor(0xA8, 0xB4, 0xC0))
+
+    _txt(s, 0.9, 6.6, 11.5, 0.6,
+         "Sumber: Tracker Project & Issue Log (Google Sheets). "
+         "Angka dihasilkan otomatis dari dashboard pada saat ekspor.",
+         size=9.5, color=RGBColor(0x7A, 0x86, 0x93))
+    return s
+
+
+def _slide_ringkasan(prs, data, hal):
+    s = _slide_kosong(prs)
+    _header(s, "Ringkasan", "Progres dan isu terbuka seluruh proyek", hal)
+
+    header = ["Proyek", "Progres", "Item selesai", "Total isu", "Isu terbuka"]
+    rows = []
+    for nama, d in data.items():
+        rows.append([
+            nama,
+            f"{d['persen']:.0f}%",
+            f"{d['selesai']}/{d['total_aktif']}",
+            str(d["iss_total"]),
+            str(d["iss_open"]) if d["iss_open"] else "—",
+        ])
+    _tabel(s, 0.7, 1.65, 11.9, header, rows, col_w=[3.4, 1.4, 1.7, 1.3, 1.5])
+
+    y = 1.65 + 0.38 + 0.34 * len(rows) + 0.45
+    perhatian = [n for n, d in data.items() if d["iss_open"] > 0]
+    tertinggal = [n for n, d in data.items() if d["persen"] < 60]
+
+    if perhatian:
+        _txt(s, 0.7, y, 11.9, 0.32,
+             f"Butuh tindak lanjut: {', '.join(perhatian)}", size=15, bold=True, color=BAD)
+        y += 0.42
+    if tertinggal:
+        _txt(s, 0.7, y, 11.9, 0.32,
+             f"Progres di bawah 60%: {', '.join(tertinggal)}", size=13, color=WARN)
+        y += 0.38
+
+    _txt(s, 0.7, 6.6, 11.9, 0.5,
+         "Metode: progres berbasis status (rasio item selesai) kecuali KCS Batam "
+         "yang memakai rata-rata kolom Progres numerik. Unit kerja tiap proyek "
+         "berbeda — bandingkan tren, bukan angka absolut antarproyek.",
+         size=9.5, color=MUTED)
+    return s
+
+
+def _slide_chart_progress(prs, data, hal):
+    s = _slide_kosong(prs)
+    _header(s, "Grafik", "Persentase penyelesaian per proyek", hal)
+
+    nama = list(data.keys())
+    cd = CategoryChartData()
+    cd.categories = nama
+    cd.add_series("Progres", [round(d["persen"], 1) for d in data.values()])
+
+    gf = s.shapes.add_chart(XL_CHART_TYPE.BAR_CLUSTERED, Inches(0.7),
+                            Inches(1.7), Inches(11.9), Inches(4.5), cd)
+    chart = gf.chart
+    chart.has_legend = False
+    _rapikan_chart(chart)
+    plot = chart.plots[0]
+    plot.gap_width = 60
+    plot.has_data_labels = True
+    dl = plot.data_labels
+    dl.number_format = '0"%"'
+    dl.number_format_is_linked = False
+    dl.font.size = Pt(11)
+    dl.font.bold = True
+    dl.font.color.rgb = INK
+    try:
+        dl.position = XL_LABEL_POSITION.OUTSIDE_END
+    except Exception:
+        pass
+    for i, n in enumerate(nama):
+        pt = plot.series[0].points[i]
+        pt.format.fill.solid()
+        pt.format.fill.fore_color.rgb = _hex_to_rgb(data[n]["cfg"].get("warna", "#3498db"))
+    chart.value_axis.maximum_scale = 100.0
+    chart.value_axis.minimum_scale = 0.0
+
+    _txt(s, 0.7, 6.5, 11.9, 0.4,
+         "Nilai 100% berarti seluruh item pada tracker berstatus selesai, "
+         "bukan berarti proyek sudah serah terima.", size=9.5, color=MUTED)
+    return s
+
+
+def _slide_chart_issue(prs, data, hal):
+    s = _slide_kosong(prs)
+    _header(s, "Grafik", "Status isu: terbuka vs tertutup", hal)
+
+    nama = list(data.keys())
+    cd = CategoryChartData()
+    cd.categories = nama
+    cd.add_series("Open", [d["iss_open"] for d in data.values()])
+    cd.add_series("Close", [d["iss_close"] for d in data.values()])
+
+    gf = s.shapes.add_chart(XL_CHART_TYPE.BAR_STACKED, Inches(0.7),
+                            Inches(1.7), Inches(11.9), Inches(4.4), cd)
+    chart = gf.chart
+    chart.has_legend = True
+    chart.legend.position = XL_LEGEND_POSITION.TOP
+    chart.legend.include_in_layout = False
+    _rapikan_chart(chart)
+    plot = chart.plots[0]
+    plot.gap_width = 60
+    plot.has_data_labels = True
+    dl = plot.data_labels
+    dl.font.size = Pt(10)
+    dl.font.color.rgb = PAPER
+    dl.position = XL_LABEL_POSITION.CENTER   # stacked: HARUS ctr/inEnd/inBase
+    plot.series[0].format.fill.solid()
+    plot.series[0].format.fill.fore_color.rgb = BAD
+    plot.series[1].format.fill.solid()
+    plot.series[1].format.fill.fore_color.rgb = OK
+
+    _txt(s, 0.7, 6.45, 11.9, 0.4,
+         "Isu tanpa status yang jelas pada issue log tidak dihitung sebagai "
+         "open maupun close.", size=9.5, color=MUTED)
+    return s
+
+
+def _kolom_issue(df):
+    """Deteksi kolom issue log secara longgar (nama kolom antar-sheet berbeda)."""
+    def cari(*kw):
+        for k in kw:
+            for c in df.columns:
+                if str(c).strip().lower() == k:
+                    return c
+        for k in kw:
+            for c in df.columns:
+                if k in str(c).lower():
+                    return c
+        return None
+    return {
+        "status": cari("status"),
+        "desc": cari("deskripsi", "description", "issue", "permasalahan"),
+        "pic": cari("pic", "penanggung"),
+        "tgl": cari("tanggal", "date"),
+    }
+
+
+def _slide_issue_open(prs, data, hal_mulai):
+    """Satu (atau lebih) slide berisi daftar isu OPEN lintas proyek."""
+    rows = []
+    for nama, d in data.items():
+        df = d.get("df_issue")
+        if df is None or df.empty:
+            continue
+        k = _kolom_issue(df)
+        if not k["status"]:
+            continue
+        mask = df[k["status"]].astype(str).str.strip().str.lower().str.contains('open', na=False)
+        for _, r in df[mask].iterrows():
+            rows.append([
+                nama,
+                _tanggal(r[k["tgl"]]) if k["tgl"] else "—",
+                _potong(r[k["desc"]]) if k["desc"] else "—",
+                _potong(r[k["pic"]], 18) if k["pic"] else "—",
+            ])
+
+    hal = hal_mulai
+    if not rows:
+        s = _slide_kosong(prs)
+        _header(s, "Isu terbuka", "Tidak ada isu terbuka", hal)
+        _txt(s, 0.7, 2.6, 11.9, 0.6,
+             "Seluruh isu yang tercatat pada issue log sudah berstatus close.",
+             size=18, bold=True, color=OK)
+        return hal + 1
+
+    total = len(rows)
+    chunks = [rows[i:i + MAX_ROW_PER_SLIDE] for i in range(0, total, MAX_ROW_PER_SLIDE)]
+    for idx, chunk in enumerate(chunks, start=1):
+        s = _slide_kosong(prs)
+        sub = f" ({idx}/{len(chunks)})" if len(chunks) > 1 else ""
+        _header(s, "Isu terbuka", f"{total} isu menunggu tindak lanjut{sub}", hal)
+        _tabel(s, 0.7, 1.7, 11.9,
+               ["Proyek", "Tanggal", "Deskripsi isu", "PIC"], chunk,
+               col_w=[2.1, 1.3, 6.9, 1.7], font=10)
+        _txt(s, 0.7, 6.7, 11.9, 0.4,
+             "Deskripsi dipotong agar muat di slide — rincian lengkap ada di issue log.",
+             size=9.5, color=MUTED)
+        hal += 1
+    return hal
+
+
+def _slide_breakdown(prs, nama, d, hal):
+    """Sebaran status pada tracker satu proyek."""
+    bd = {k: v for k, v in (d.get("breakdown") or {}).items() if str(k).strip()}
+    if not bd:
+        return hal
+    bd = dict(sorted(bd.items(), key=lambda kv: -kv[1])[:8])
+
+    s = _slide_kosong(prs)
+    _header(s, f"Detail — {nama}", "Sebaran status pekerjaan pada tracker", hal)
+
+    cd = CategoryChartData()
+    cd.categories = [_potong(k, 22) for k in bd.keys()]
+    cd.add_series("Jumlah", list(bd.values()))
+    gf = s.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(0.7),
+                            Inches(1.8), Inches(8.2), Inches(4.3), cd)
+    chart = gf.chart
+    chart.has_legend = False
+    _rapikan_chart(chart)
+    plot = chart.plots[0]
+    plot.gap_width = 80
+    plot.has_data_labels = True
+    plot.data_labels.font.size = Pt(11)
+    plot.data_labels.font.bold = True
+    plot.data_labels.font.color.rgb = INK
+    plot.series[0].format.fill.solid()
+    plot.series[0].format.fill.fore_color.rgb = _hex_to_rgb(d["cfg"].get("warna", "#3498db"))
+
+    _kpi(s, 9.3, 1.9, 3.3, f"{d['persen']:.0f}%", "progres tercatat")
+    _kpi(s, 9.3, 3.2, 3.3, f"{d['selesai']}/{d['total_aktif']}", "item selesai / total")
+    _kpi(s, 9.3, 4.5, 3.3, str(d["iss_open"]), "isu terbuka",
+         warna=BAD if d["iss_open"] else OK)
+    return hal + 1
+
+
+def build_pptx(data, judul="Progres Proyek dan Isu Terbuka", tanggal=None,
+               sertakan_breakdown=True):
+    """Bangun deck dan kembalikan BytesIO siap dipakai st.download_button."""
+    if tanggal is None:
+        now = datetime.now()
+        tanggal = f"{now.day} {BULAN_ID[now.month - 1]} {now.year}"
+
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+
+    _slide_cover(prs, data, judul, tanggal)
+    hal = 2
+    _slide_ringkasan(prs, data, hal); hal += 1
+    _slide_chart_progress(prs, data, hal); hal += 1
+    _slide_chart_issue(prs, data, hal); hal += 1
+    hal = _slide_issue_open(prs, data, hal)
+
+    if sertakan_breakdown:
+        for nama, d in data.items():
+            hal = _slide_breakdown(prs, nama, d, hal)
+
+    buf = BytesIO()
+    prs.save(buf)
+    buf.seek(0)
+    return buf
+
+
+# ═══════════════════════════════════════════════════════════
 # MAIN APP
 # ═══════════════════════════════════════════════════════════
 try:
     col_title, col_btn = st.columns([5, 1])
     with col_title:
         st.title("📊 Dashboard Overview Project")
-        st.caption("Gabungan progress & issue: DSSP · KCS CIMB Batam · KDS · Nova")
+        st.caption("Gabungan progress & issue: DSSP · KCS CIMB Batam · KDS · Nova · Uniqlo")
     with col_btn:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🔄 Muat Ulang", use_container_width=True):
@@ -432,6 +870,46 @@ try:
     m4.metric("🔴 Issue OPEN (perlu tindak)", total_open_all,
               delta=None if total_open_all == 0 else f"{total_open_all} butuh aksi",
               delta_color="inverse")
+
+    st.markdown("---")
+
+    # ══════════════════════════════════════════════════════
+    # SECTION 1B: EKSPOR KE POWERPOINT
+    # ══════════════════════════════════════════════════════
+    with st.expander("📤 Ekspor laporan ke PowerPoint (.pptx)"):
+        ex1, ex2 = st.columns([2, 1])
+        with ex1:
+            judul_deck = st.text_input("Judul deck", "Progres Proyek dan Isu Terbuka")
+            pilih_proyek = st.multiselect(
+                "Proyek yang disertakan", list(data.keys()), default=list(data.keys()),
+                help="Keluarkan proyek yang belum berjalan agar grafik tidak menyesatkan.")
+        with ex2:
+            tgl_deck = st.text_input("Tanggal data", datetime.now().strftime("%d %B %Y"))
+            ikut_detail = st.checkbox("Slide breakdown status per proyek", True)
+
+        if not pilih_proyek:
+            st.warning("Pilih minimal satu proyek.")
+        elif st.button("🛠️ Buat file PPTX"):
+            subset = {k: v for k, v in data.items() if k in pilih_proyek}
+            with st.spinner("Menyusun slide..."):
+                st.session_state["pptx_buf"] = build_pptx(
+                    subset, judul=judul_deck, tanggal=tgl_deck,
+                    sertakan_breakdown=ikut_detail).getvalue()
+            st.success("File siap diunduh.")
+
+        if st.session_state.get("pptx_buf"):
+            st.download_button(
+                "⬇️ Unduh PPTX",
+                st.session_state["pptx_buf"],
+                file_name=f"Progress_Issue_Report_{datetime.now():%d%m%Y}.pptx",
+                mime=("application/vnd.openxmlformats-officedocument"
+                      ".presentationml.presentation"),
+                use_container_width=False,
+            )
+        st.caption(
+            "ℹ️ Deck ini berisi data mentah (grafik + daftar isu), bukan laporan naratif. "
+            "Analisa, konteks MoM/email, dan rekomendasi tetap perlu ditambahkan manual."
+        )
 
     st.markdown("---")
 
@@ -576,7 +1054,7 @@ try:
             else:
                 tab_t, tab_i, tab_s = st.tabs(
                     ["📋 Tracker", "🐞 Issue Log", "📊 Breakdown Status"])
-                
+
             with tab_t:
                 if not d["df_track"].empty:
                     st.dataframe(d["df_track"], use_container_width=True, height=360)
@@ -655,6 +1133,7 @@ try:
                             tampil[c] = tampil[c].map(lambda v: f"Rp {v:,.0f}")
                         tampil['Margin %'] = rincian['Margin %'].map(lambda v: f"{v:.1f}%")
                         st.dataframe(tampil, use_container_width=True, hide_index=True, height=300)
+
             if punya_cost_health:
                 with tab_c:
                     ch = compute_cost_health(d["df_track"], nama)
@@ -750,7 +1229,8 @@ try:
                             tampil_u = unreal[['Lokasi', 'Kota', 'Plan']].copy()
                             tampil_u['Plan'] = tampil_u['Plan'].map(lambda v: f"Rp {v:,.0f}")
                             tampil_u['Actual'] = "— belum diisi —"
-                            st.dataframe(tampil_u, use_container_width=True,hide_index=True, height=240)
+                            st.dataframe(tampil_u, use_container_width=True,
+                                         hide_index=True, height=240)
 
 except Exception as e:
     st.error(f"Terjadi kesalahan sistem: {e}")
